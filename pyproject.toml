@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "racing-line-prediction"
+version = "0.1.0"
+description = "Physics-informed ML project for optimal racing line and apex speed prediction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "pandas>=2.1",
+    "torch>=2.2",
+    "pytest>=8.0",
+    "scipy>=1.11",
+    "streamlit>=1.36",
+]
+
+[project.scripts]
+racingline-train = "racing_line_pinn.cli:main"
+racingline-demo = "app:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
