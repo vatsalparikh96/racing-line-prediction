@@ -42,7 +42,7 @@ print(f"Target speed (m/s): {speed:.2f}")
 
 ## Notes
 
-This repository is now structured as a credible research starter: it includes physics-based guidance, synthetic track generation, a small training loop, telemetry comparison utilities, real-data ingestion scaffolding for `FastF1`, and session-level comparison logic.
+This repository includes physics-based guidance, synthetic track generation, a small training loop, telemetry comparison utilities, real-data ingestion from OpenF1, and session-level comparison logic.
 
 The intended workflow is:
 

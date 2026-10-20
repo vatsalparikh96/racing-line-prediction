@@ -10,12 +10,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
-    "matplotlib>=3.8",
     "pandas>=2.1",
     "torch>=2.2",
     "pytest>=8.0",
     "scipy>=1.11",
     "streamlit>=1.36",
+    "plotly>=5.20",
+    "requests>=2.31",
 ]
 
 [project.scripts]

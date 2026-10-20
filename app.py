@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
-from racing_line_pinn.compare import calculate_speed_metrics
-from racing_line_pinn.live_demo import CAR_PRESETS, TRACK_LIBRARY, simulate_session
-from racing_line_pinn.real_data import load_fastf1_session
-from racing_line_pinn.session_analysis import compare_session_to_model
+from racing_line_pinn.calibration import VehicleParams, calibrate_vehicle_params, load_vehicle_params, save_vehicle_params
+from racing_line_pinn.evaluation import build_leaderboard
+from racing_line_pinn.real_data import SpaSessionData, load_spa_race_session
+from racing_line_pinn.training import train_model
+from racing_line_pinn.visualization import build_animated_lap
 
+TRAIN_EPOCHS = 200
+TRAIN_LEARNING_RATE = 1e-3
+TRAIN_HIDDEN_DIM = 64
+FRAME_DT = 0.2
+PLAYBACK_MULTIPLIERS = {"1x": 1, "2x": 2, "4x": 4}
 
 st.markdown(
     """
@@ -22,21 +27,11 @@ st.markdown(
         background: #0d1622;
         border-right: 1px solid rgba(255,255,255,0.08);
     }
-    .stMetric {
-        background: rgba(18,30,43,0.9);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 10px;
-        padding: 12px 14px;
-        box-shadow: 0 0 0 1px rgba(255,255,255,0.02);
-    }
     h1, h2, h3 {
         color: #f2f5fb !important;
         letter-spacing: 0.02em;
     }
-    .stSlider > div > div > div {
-        background: rgba(255,255,255,0.04);
-    }
-    .stSelectbox, .stCheckbox {
+    .stSelectbox, .stCheckbox, .stRadio {
         color: #edf4ff;
     }
     .block-container {
@@ -48,166 +43,101 @@ st.markdown(
 )
 
 
-def build_lap_figure(session: dict, frame_index: int | None = None):
-    if frame_index is None:
-        frame_index = len(session["x"]) - 1
-    frame_index = max(0, min(frame_index, len(session["x"]) - 1))
+@st.cache_resource(show_spinner="Loading Spa telemetry, calibrating, and training the ideal-line model...")
+def _load_pipeline() -> tuple[SpaSessionData, VehicleParams, np.ndarray] | None:
+    session = load_spa_race_session()
+    if session is None:
+        return None
 
-    ideal_x = session["x"][: frame_index + 1]
-    ideal_y = session["y"][: frame_index + 1]
-    actual_x = session["actual_x"][: frame_index + 1]
-    actual_y = session["actual_y"][: frame_index + 1]
+    vehicle = load_vehicle_params()
+    if vehicle is None:
+        vehicle = calibrate_vehicle_params(session)
+        save_vehicle_params(vehicle)
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=ideal_x, y=ideal_y, mode="lines", name="Ideal racing line", line=dict(color="#ff7f0e", width=4)))
-    fig.add_trace(go.Scatter(x=actual_x, y=actual_y, mode="lines", name="Actual lap", line=dict(color="#4ea1ff", width=4)))
-    fig.add_trace(go.Scatter(x=[session["apex_x"]], y=[session["apex_y"]], mode="markers", name="Apex", marker=dict(color="#ff3d3d", size=12, symbol="star-diamond")))
-
-    fig.update_layout(
-        template="plotly_dark",
-        title="Track map and line comparison",
-        xaxis_title="X [m]",
-        yaxis_title="Y [m]",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=20, r=20, t=40, b=20),
-        height=500,
-        paper_bgcolor="#050b14",
-        plot_bgcolor="#09131d",
-        font=dict(color="#eaf2ff"),
+    _model, predicted_speed = train_model(
+        session.s,
+        session.curvature,
+        vehicle,
+        epochs=TRAIN_EPOCHS,
+        learning_rate=TRAIN_LEARNING_RATE,
+        hidden_dim=TRAIN_HIDDEN_DIM,
     )
-    fig.update_xaxes(scaleanchor="y", scaleratio=1, gridcolor="rgba(255,255,255,0.08)")
-    fig.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
-    return fig
+    return session, vehicle, predicted_speed.numpy()
 
 
-def build_speed_heatmap(session: dict):
-    z = np.vstack([session["predicted_speed"], session["actual_speed"]])
-    fig = go.Figure(data=go.Heatmap(
-        z=z,
-        x=np.linspace(0, 1, len(session["predicted_speed"])),
-        y=["Model", "Actual"],
-        colorscale="Turbo",
-        hovertemplate="Lap fraction: %{x:.2f}<br>Speed: %{z:.1f} m/s<extra></extra>",
-    ))
+def _apply_playback_speed(fig, multiplier: int) -> None:
+    """Speed up the Play button's frame rate without re-sampling the animation."""
+    frame_duration_ms = max(int(FRAME_DT * 1000 / multiplier), 1)
     fig.update_layout(
-        template="plotly_dark",
-        title="Speed heatmap by lap segment",
-        xaxis_title="Lap progress",
-        yaxis_title="Signal",
-        margin=dict(l=20, r=20, t=50, b=20),
-        height=350,
-        paper_bgcolor="#050b14",
-        plot_bgcolor="#09131d",
-        font=dict(color="#eaf2ff"),
-        annotations=[
+        updatemenus=[
             dict(
-                text="Brighter colors = faster speed. Top row = physics model; bottom row = actual lap trace.",
-                x=0.5,
-                y=1.12,
-                xref="paper",
-                yref="paper",
-                showarrow=False,
-                font=dict(size=12, color="#dfeaff"),
-                align="center",
+                type="buttons",
+                showactive=False,
+                x=0.05, y=1.12, xanchor="left", yanchor="top",
+                buttons=[
+                    dict(
+                        label="Play", method="animate",
+                        args=[None, {"frame": {"duration": frame_duration_ms, "redraw": True}, "fromcurrent": True, "transition": {"duration": 0}}],
+                    ),
+                    dict(
+                        label="Pause", method="animate",
+                        args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}],
+                    ),
+                ],
             )
-        ],
+        ]
     )
-    return fig
 
 
 def main() -> None:
-    st.set_page_config(page_title="Racing Line Live Demo", layout="wide")
-    st.title("F1 Optimal Racing Line Live Demo")
-    st.caption("Real-world telemetry path is supported when FastF1 data is available; synthetic track data is a fallback demo mode.")
+    st.set_page_config(page_title="Spa Racing Line", layout="wide")
+    st.title("F1 Racing Line Prediction - Spa-Francorchamps")
+    st.caption("2023 Race session: real telemetry vs. a physics-informed ideal-line model.")
+
+    pipeline = _load_pipeline()
+    if pipeline is None:
+        st.error("Could not load the 2023 Spa race session from OpenF1 (network unavailable or no session data).")
+        return
+    session, vehicle, predicted_speed = pipeline
+
+    driver_codes = sorted(session.drivers.keys())
+    leaderboard = build_leaderboard(session.drivers, session.s, predicted_speed)
 
     with st.sidebar:
-        st.header("Vehicle setup")
-        data_mode = st.radio("Data source", ["Synthetic demo", "FastF1 telemetry"], index=0)
-        track_name = st.selectbox("Track", options=list(TRACK_LIBRARY.keys()))
-        car_name = st.selectbox("Car", options=list(CAR_PRESETS.keys()))
-        st.caption("Preset tracks are stylized for the demo; real FastF1 sessions are used when available.")
+        st.header("View options")
+        driver_code = st.selectbox("Driver", options=driver_codes, index=driver_codes.index(session.reference_driver))
+        show_ghost = st.checkbox("Show model ghost", value=False)
+        playback_label = st.radio("Playback speed", options=list(PLAYBACK_MULTIPLIERS.keys()), index=1, horizontal=True)
+        st.caption(f"Calibrated: \u03bc={vehicle.mu:.2f}, mass={vehicle.mass:.0f} kg")
+        if not session.drivers[driver_code].lap_complete:
+            st.warning("Partial telemetry only; this driver did not complete a timed lap.")
 
-        if car_name == "Custom":
-            mu = st.slider("Tyre friction coefficient μ", 1.0, 1.8, 1.35, step=0.01)
-            downforce = st.slider("Downforce [N]", 1000, 6000, 3000, step=50)
-            mass = st.slider("Vehicle mass [kg]", 600, 950, 800, step=10)
-            amplitude = st.slider("Track amplitude", 0.6, 1.8, 1.0, step=0.05)
-        else:
-            setup = CAR_PRESETS[car_name]
-            mu = setup["mu"]
-            downforce = setup["downforce"]
-            mass = setup["mass"]
-            amplitude = 1.0
+    fig = build_animated_lap(
+        session,
+        driver_code,
+        model_speed=predicted_speed if show_ghost else None,
+        frame_dt=FRAME_DT,
+    )
+    _apply_playback_speed(fig, PLAYBACK_MULTIPLIERS[playback_label])
+    st.plotly_chart(fig, use_container_width=True)
 
-    if data_mode == "FastF1 telemetry":
-        telemetry = load_fastf1_session(circuit=track_name, year=2023, session_name="R")
-        if telemetry.data.get("x") and telemetry.data.get("speed"):
-            comparison = compare_session_to_model(
-                {"x": telemetry.data["x"], "y": telemetry.data["y"], "speed": telemetry.data["speed"]},
-                mu=mu,
-                downforce=downforce,
-                mass=mass,
-            )
-            session = {
-                "x": np.asarray(telemetry.data["x"], dtype=float),
-                "y": np.asarray(telemetry.data["y"], dtype=float),
-                "actual_x": np.asarray(telemetry.data["x"], dtype=float),
-                "actual_y": np.asarray(telemetry.data["y"], dtype=float),
-                "predicted_speed": np.asarray(comparison["predicted_speed"], dtype=float),
-                "actual_speed": np.asarray(comparison["actual_speed"], dtype=float),
-                "curvature": np.asarray(comparison["curvature"], dtype=float),
-                "apex_x": float(np.asarray(telemetry.data["x"]).mean()),
-                "apex_y": float(np.asarray(telemetry.data["y"]).mean()),
-                "track_name": telemetry.circuit,
-            }
-            st.success("FastF1 telemetry data loaded successfully for comparison.")
-        else:
-            st.warning("FastF1 data was not available in this environment. Falling back to the synthetic demo mode for the UI.")
-            session = simulate_session(
-                track_name=track_name,
-                mu=mu,
-                downforce=downforce,
-                mass=mass,
-                amplitude=amplitude,
-            )
-    else:
-        session = simulate_session(
-            track_name=track_name,
-            mu=mu,
-            downforce=downforce,
-            mass=mass,
-            amplitude=amplitude,
-        )
+    st.subheader("Leaderboard - time delta vs. the model")
+    leaderboard_rows = [
+        {
+            "Driver": comparison.driver,
+            "Lap Time (s)": round(session.drivers[comparison.driver].lap_time, 3),
+            "\u0394 vs Model (s)": round(comparison.total_delta_t, 3),
+            "RMSE (m/s)": round(comparison.rmse, 2),
+        }
+        for comparison in leaderboard
+    ]
+    leaderboard_df = pd.DataFrame(leaderboard_rows)
 
-    metrics = {
-        "Predicted apex speed": f"{session['predicted_speed'].max():.1f} m/s",
-        "Mean speed": f"{session['predicted_speed'].mean():.1f} m/s",
-        "Peak curvature": f"{session['curvature'].max():.3f}",
-    }
+    def _highlight_selected(row: pd.Series) -> list[str]:
+        is_selected = row["Driver"] == driver_code
+        return ["background-color: #1d3a5f" if is_selected else "" for _ in row]
 
-    cols = st.columns(3)
-    for col, (label, value) in zip(cols, metrics.items()):
-        col.metric(label, value)
-
-    st.subheader("Actual vs ideal lap")
-    trajectory_progress = st.slider("Lap progress", 0, len(session["x"]) - 1, len(session["x"]) - 1, key="lap_progress", label_visibility="collapsed")
-    st.plotly_chart(build_lap_figure(session, frame_index=trajectory_progress), use_container_width=True)
-
-    left, right = st.columns(2)
-    with left:
-        st.subheader("Speed heatmap")
-        st.caption("Each row is one speed signal. Top = physics model, bottom = actual lap speed. Brighter colors indicate higher speeds.")
-        st.plotly_chart(build_speed_heatmap(session), use_container_width=True)
-    with right:
-        st.subheader("Speed trace")
-        speed_df = pd.DataFrame({
-            "Lap progress": np.linspace(0, 1, len(session["predicted_speed"])),
-            "Ideal speed": session["predicted_speed"],
-            "Actual speed": session["actual_speed"],
-        })
-        st.line_chart(speed_df.set_index("Lap progress"))
-
-    st.caption(f"Track: {track_name} | Car: {car_name} | Setup: μ={mu:.2f}, downforce={downforce} N, mass={mass} kg")
+    st.dataframe(leaderboard_df.style.apply(_highlight_selected, axis=1), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":

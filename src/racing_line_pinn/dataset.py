@@ -1,74 +1,97 @@
-"""Synthetic and real-telemetry dataset utilities for racing-line modeling."""
+"""Physics-coupled training-sample generation for the racing-line model.
+
+Replaces per-driver data mixing with a single physically self-consistent
+speed profile: a forward/backward minimum-lap-time solve (corner grip cap,
+traction-limited acceleration, max-braking deceleration) computed purely from
+track curvature and the Phase-2 calibrated :class:`VehicleParams` -- the
+fastest profile achievable by ONE physically-consistent car, not a
+cross-driver composite.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
 
 import numpy as np
 import torch
 
-from .physics import compute_racing_line_target_speed
+from .calibration import VehicleParams
+from .physics import calculate_aero_drag, calculate_speed_dependent_normal_load
+
+GRAVITY = 9.81
 
 
-@dataclass
-class TrackSample:
-    curvature: float
-    radius: float
-    mu: float
-    downforce: float
-    mass: float
-    target_speed: float
+def _corner_cap_speed(curvature: np.ndarray, vehicle: VehicleParams, iterations: int = 30) -> np.ndarray:
+    """Self-consistent grip-limited speed at every point (no braking/throttle, long_accel=0).
 
-
-def generate_synthetic_track_samples(
-    n_samples: int = 2048,
-    mu_min: float = 1.2,
-    mu_max: float = 1.6,
-    downforce_min: float = 1800.0,
-    downforce_max: float = 4500.0,
-    mass_min: float = 700.0,
-    mass_max: float = 850.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Generate a synthetic dataset of corner curvatures and physics conditions."""
-    rng = np.random.default_rng(42)
-    curvature = rng.uniform(0.02, 0.18, size=n_samples).astype(np.float32)
-    radius = 1.0 / curvature
-    mu = rng.uniform(mu_min, mu_max, size=n_samples).astype(np.float32)
-    downforce = rng.uniform(downforce_min, downforce_max, size=n_samples).astype(np.float32)
-    mass = rng.uniform(mass_min, mass_max, size=n_samples).astype(np.float32)
-
-    target_speed = np.array(
-        [
-            compute_racing_line_target_speed(
-                curvature=float(c),
-                radius=float(r),
-                mu=float(m),
-                mass=float(mass_i),
-                downforce=float(d),
-            )
-            for c, r, m, mass_i, d in zip(curvature, radius, mu, mass, downforce)
-        ],
-        dtype=np.float32,
-    )
-
-    features = np.stack([curvature, radius, mu, downforce], axis=1).astype(np.float32)
-    return (
-        torch.tensor(features),
-        torch.tensor(curvature),
-        torch.tensor(mu),
-        torch.tensor(downforce),
-        torch.tensor(mass),
-        torch.tensor(target_speed),
-    )
-
-
-def load_fastf1_telemetry(path: str | None = None):
-    """Optional hook for real FastF1 telemetry ingestion.
-
-    If FastF1 is not installed or a path is not provided, this returns a synthetic
-    placeholder dataset so the project can still execute in offline environments.
+    Downforce grows with speed, so the grip limit itself depends on speed;
+    this iterates to a fixed point rather than solving in closed form.
     """
-    if path is not None:
-        return path
+    radius = 1.0 / np.maximum(np.abs(curvature), 1e-6)
+    speed = np.sqrt(vehicle.mu * GRAVITY * radius)
+    for _ in range(iterations):
+        normal_force = calculate_speed_dependent_normal_load(vehicle.mass, speed, 1.0, vehicle.aero_lift_area)
+        lateral_limit = vehicle.mu * normal_force / vehicle.mass
+        speed = np.sqrt(np.maximum(lateral_limit * radius, 0.0))
+    return speed
 
-    return generate_synthetic_track_samples()
+
+def _forward_pass(
+    s: np.ndarray, corner_cap: np.ndarray, vehicle: VehicleParams, start_speed: float | None = None
+) -> np.ndarray:
+    """Propagate speed forward, limited by traction-limited accel minus aero drag."""
+    ds = np.diff(s)
+    speed = np.empty_like(corner_cap)
+    speed[0] = min(start_speed, corner_cap[0]) if start_speed is not None else corner_cap[0]
+    for i in range(1, speed.size):
+        v_prev = float(speed[i - 1])
+        drag_decel = float(calculate_aero_drag(v_prev, 1.0, vehicle.aero_drag_area)) / vehicle.mass
+        net_accel = max(vehicle.max_accel - drag_decel, 0.0)
+        v_candidate = math.sqrt(v_prev ** 2 + 2.0 * net_accel * ds[i - 1])
+        speed[i] = min(v_candidate, corner_cap[i])
+    return speed
+
+
+def _backward_pass(
+    s: np.ndarray, corner_cap: np.ndarray, max_decel: float, start_speed: float | None = None
+) -> np.ndarray:
+    """Propagate speed backward from each point, limited by max braking deceleration."""
+    ds = np.diff(s)
+    speed = np.empty_like(corner_cap)
+    speed[-1] = min(start_speed, corner_cap[-1]) if start_speed is not None else corner_cap[-1]
+    for i in range(speed.size - 2, -1, -1):
+        v_next = float(speed[i + 1])
+        v_candidate = math.sqrt(v_next ** 2 + 2.0 * max_decel * ds[i])
+        speed[i] = min(v_candidate, corner_cap[i])
+    return speed
+
+
+def build_training_samples(
+    s: np.ndarray, curvature: np.ndarray, vehicle: VehicleParams
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the physics-coupled target speed profile for one session's curvature(s).
+
+    Runs the corner-cap -> forward-accel -> backward-brake solve, then takes
+    the minimum at each point -- the fastest profile achievable by one
+    physically-consistent car. Each pass runs twice (second pass seeded from
+    the first pass's far end) to approximate the closed-loop steady state of
+    a repeating lap, since the track is a circuit, not an isolated segment.
+
+    Returns ``(curvature, target_speed, corner_cap)`` tensors, all aligned to
+    ``s``'s order and length.
+    """
+    corner_cap = _corner_cap_speed(curvature, vehicle)
+
+    v_fwd = _forward_pass(s, corner_cap, vehicle)
+    v_fwd = _forward_pass(s, corner_cap, vehicle, start_speed=float(v_fwd[-1]))
+
+    v_bwd = _backward_pass(s, corner_cap, vehicle.max_decel)
+    v_bwd = _backward_pass(s, corner_cap, vehicle.max_decel, start_speed=float(v_bwd[0]))
+
+    target_speed = np.minimum(np.minimum(corner_cap, v_fwd), v_bwd)
+
+    return (
+        torch.tensor(curvature, dtype=torch.float32),
+        torch.tensor(target_speed, dtype=torch.float32),
+        torch.tensor(corner_cap, dtype=torch.float32),
+    )

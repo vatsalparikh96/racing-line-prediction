@@ -1,8 +1,8 @@
 numpy>=1.26
-matplotlib>=3.8
 pandas>=2.1
 torch>=2.2
 pytest>=8.0
 scipy>=1.11
 streamlit>=1.36
-fastf1>=3.0.0
+requests>=2.31
+plotly>=5.20

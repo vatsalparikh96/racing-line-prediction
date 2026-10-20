@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Racing Line PINN — App State Flow Diagram</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: #0d1622;
+    color: #eaf2ff;
+    margin: 0;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  p.subtitle {
+    margin-top: 0;
+    color: #9fb3cc;
+    font-size: 0.9rem;
+  }
+  .toolbar {
+    margin: 12px 0 20px;
+  }
+  button {
+    background: #1a2a3d;
+    color: #eaf2ff;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  button:hover {
+    background: #24374d;
+  }
+  .diagram-wrap {
+    background: #050b14;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 24px;
+    overflow: auto;
+  }
+  .legend-swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .legend-swatch.existing {
+    background: #1a2a3d;
+    border: 1px solid rgba(255,255,255,0.3);
+  }
+  .legend-swatch.planned {
+    background: #3a2f10;
+    border: 1px dashed #f5a623;
+  }
+  .legend-swatch.deprecated {
+    background: #3a1010;
+    border: 1px dashed #ff4d4d;
+  }
+  table.matrix {
+    border-collapse: collapse;
+    width: 100%;
+    margin-top: 12px;
+    font-size: 0.88rem;
+  }
+  table.matrix th, table.matrix td {
+    border: 1px solid rgba(255,255,255,0.12);
+    padding: 10px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  table.matrix th {
+    background: #14202f;
+    color: #f2f5fb;
+  }
+  table.matrix td {
+    background: rgba(18,30,43,0.6);
+  }
+  @media print {
+    .toolbar { display: none; }
+    body { background: #fff; color: #000; }
+    .diagram-wrap { border: none; background: #fff; }
+    table.matrix th, table.matrix td { color: #000; background: #fff; }
+  }
+</style>
+</head>
+<body>
+  <h1>Racing Line PINN — App State Flow Diagram</h1>
+  <p class="subtitle">
+    Streamlit reruns the whole script on every widget interaction; this shows the resulting execution states in app.py.<br/>
+    <span class="legend-swatch existing"></span> Implemented &nbsp;&nbsp;
+    <span class="legend-swatch planned"></span> Planned extension (not yet implemented) &nbsp;&nbsp;
+    <span class="legend-swatch deprecated"></span> To be replaced
+  </p>
+  <div class="toolbar">
+    <button onclick="window.print()">Print / Export as PDF</button>
+  </div>
+  <div class="diagram-wrap">
+    <pre class="mermaid">
+stateDiagram-v2
+    [*] --> ScriptStart : user opens/interacts with app
+    note left of ScriptStart
+        (planned) @st.cache_resource wraps
+        PyTorch model loading
+    end note
+
+    ScriptStart --> SidebarConfig : render sidebar widgets\n(data_mode, track, car, sliders,\n(planned) aero C_L/C_D sliders)
+
+    SidebarConfig --> DataModeBranch : read selected data_mode
+
+    state DataModeBranch &lt;&lt;choice&gt;&gt;
+    DataModeBranch --> OpenF1SessionRequest : "OpenF1 telemetry"
+    DataModeBranch --> SimulateSynthetic : "Synthetic demo"
+
+    OpenF1SessionRequest --> OpenF1DataCheck : fetch session roster and lap records
+
+    state OpenF1DataCheck &lt;&lt;choice&gt;&gt;
+    OpenF1DataCheck --> NormalizeRotate : complete roster and telemetry present
+    OpenF1DataCheck --> FallbackWarning : request failed or roster incomplete
+
+    NormalizeRotate --> ConvertToFrenet : (planned) center dm to m,\nPCA rotation so straights are horizontal
+    ConvertToFrenet --> ComputeTrackBoundaries : (planned) cartesian (X,Y) to (s, d)
+    ComputeTrackBoundaries --> CompareToModel : (planned) derive W(s),\n|d(s)| <= W(s)/2
+
+    CompareToModel --> BuildSessionFromTelemetry : compare_session_to_model()
+    BuildSessionFromTelemetry --> ShowSuccessMsg
+
+    FallbackWarning --> SimulateSynthetic : show warning, use synthetic
+
+    SimulateSynthetic --> SessionReady : simulate_session()
+    ShowSuccessMsg --> SessionReady
+
+    SessionReady --> ComputeMetrics : max/mean speed, peak curvature\n(planned) downforce load limit,\nPacejka G-G, weight transfer
+    ComputeMetrics --> RenderMetricCards
+
+    note right of RenderMetricCards
+        (planned) current speed trace, heatmap,
+        and lap figure are fully replaced below,
+        not extended
+    end note
+
+    RenderMetricCards --> RenderTrackMap : slider = lap progress\n(planned) rotated map color-coded by delta v(s),\naspect locked scaleanchor='x'\nreplaces unaligned lap figure
+    RenderTrackMap --> RenderGGDiagram : (planned) G-G scatter with dynamic\nfriction envelope; replaces 2-row heatmap
+    RenderGGDiagram --> RenderSpeedSubplot : (planned) subplot 1: v_Actual vs v_PINN;\nreplaces single spiking speed chart
+    RenderSpeedSubplot --> RenderDeltaTimeSubplot : (planned) subplot 2: continuous delta t(s);\nno prior equivalent
+    RenderDeltaTimeSubplot --> RenderCaption
+    RenderCaption --> Idle
+
+    Idle --> ScriptStart : any widget change\n(slider/select/radio)\ntriggers full rerun\n(planned) cached resources persist
+    </pre>
+  </div>
+
+  <h2 style="font-size:1.1rem;margin-top:32px;">Implementation Target Matrix</h2>
+  <p class="subtitle">
+    Current output graphs (red, dashed) are considered worthless and are slated for full replacement — not incremental extension.
+  </p>
+  <table class="matrix">
+    <thead>
+      <tr>
+        <th>Target Component</th>
+        <th>Old Implementation</th>
+        <th>New Replacement</th>
+        <th>Benefit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Speed Trace</td>
+        <td>Single chart with spiking artifact curves</td>
+        <td>Subplot 1: Speed (v<sub>Actual</sub> vs. v<sub>PINN</sub>)</td>
+        <td>Eliminates scaling anomalies and clarifies speed gaps</td>
+      </tr>
+      <tr>
+        <td>Delta Time</td>
+        <td>None</td>
+        <td>Subplot 2: continuous Δt(s) curve in seconds</td>
+        <td>Quantifies time loss per corner/sector</td>
+      </tr>
+      <tr>
+        <td>Grip Limits</td>
+        <td>2-row color heatmap</td>
+        <td>G–G scatter plot with dynamic friction envelope</td>
+        <td>Displays brake/cornering traction envelope usage</td>
+      </tr>
+      <tr>
+        <td>Track Map</td>
+        <td>Unaligned coordinate plot</td>
+        <td>Rotated 2D line map color-coded by speed delta Δv</td>
+        <td>Shows spatial time loss directly on track geometry</td>
+      </tr>
+    </tbody>
+  </table>
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</body>
+</html>

@@ -1,0 +1,3173 @@
+diff --git a/app.py b/app.py
+index 875237d..2f6a2c4 100644
+--- a/app.py
++++ b/app.py
+@@ -2,14 +2,19 @@ from __future__ import annotations
+ 
+ import numpy as np
+ import pandas as pd
+-import plotly.graph_objects as go
+ import streamlit as st
+ 
+-from racing_line_pinn.compare import calculate_speed_metrics
+-from racing_line_pinn.live_demo import CAR_PRESETS, TRACK_LIBRARY, simulate_session
+-from racing_line_pinn.real_data import load_fastf1_session
+-from racing_line_pinn.session_analysis import compare_session_to_model
++from racing_line_pinn.calibration import VehicleParams, calibrate_vehicle_params, load_vehicle_params, save_vehicle_params
++from racing_line_pinn.evaluation import build_leaderboard
++from racing_line_pinn.real_data import SpaSessionData, load_spa_race_session
++from racing_line_pinn.training import train_model
++from racing_line_pinn.visualization import build_animated_lap
+ 
++TRAIN_EPOCHS = 200
++TRAIN_LEARNING_RATE = 1e-3
++TRAIN_HIDDEN_DIM = 64
++FRAME_DT = 0.2
++PLAYBACK_MULTIPLIERS = {"1x": 1, "2x": 2, "4x": 4}
+ 
+ st.markdown(
+     """
+@@ -22,21 +27,11 @@ st.markdown(
+         background: #0d1622;
+         border-right: 1px solid rgba(255,255,255,0.08);
+     }
+-    .stMetric {
+-        background: rgba(18,30,43,0.9);
+-        border: 1px solid rgba(255,255,255,0.08);
+-        border-radius: 10px;
+-        padding: 12px 14px;
+-        box-shadow: 0 0 0 1px rgba(255,255,255,0.02);
+-    }
+     h1, h2, h3 {
+         color: #f2f5fb !important;
+         letter-spacing: 0.02em;
+     }
+-    .stSlider > div > div > div {
+-        background: rgba(255,255,255,0.04);
+-    }
+-    .stSelectbox, .stCheckbox {
++    .stSelectbox, .stCheckbox, .stRadio {
+         color: #edf4ff;
+     }
+     .block-container {
+@@ -48,166 +43,99 @@ st.markdown(
+ )
+ 
+ 
+-def build_lap_figure(session: dict, frame_index: int | None = None):
+-    if frame_index is None:
+-        frame_index = len(session["x"]) - 1
+-    frame_index = max(0, min(frame_index, len(session["x"]) - 1))
+-
+-    ideal_x = session["x"][: frame_index + 1]
+-    ideal_y = session["y"][: frame_index + 1]
+-    actual_x = session["actual_x"][: frame_index + 1]
+-    actual_y = session["actual_y"][: frame_index + 1]
++@st.cache_resource(show_spinner="Loading Spa telemetry, calibrating, and training the ideal-line model...")
++def _load_pipeline() -> tuple[SpaSessionData, VehicleParams, np.ndarray] | None:
++    session = load_spa_race_session()
++    if session is None:
++        return None
++
++    vehicle = load_vehicle_params()
++    if vehicle is None:
++        vehicle = calibrate_vehicle_params(session)
++        save_vehicle_params(vehicle)
++
++    _model, predicted_speed = train_model(
++        session.s,
++        session.curvature,
++        vehicle,
++        epochs=TRAIN_EPOCHS,
++        learning_rate=TRAIN_LEARNING_RATE,
++        hidden_dim=TRAIN_HIDDEN_DIM,
++    )
++    return session, vehicle, predicted_speed.numpy()
+ 
+-    fig = go.Figure()
+-    fig.add_trace(go.Scatter(x=ideal_x, y=ideal_y, mode="lines", name="Ideal racing line", line=dict(color="#ff7f0e", width=4)))
+-    fig.add_trace(go.Scatter(x=actual_x, y=actual_y, mode="lines", name="Actual lap", line=dict(color="#4ea1ff", width=4)))
+-    fig.add_trace(go.Scatter(x=[session["apex_x"]], y=[session["apex_y"]], mode="markers", name="Apex", marker=dict(color="#ff3d3d", size=12, symbol="star-diamond")))
+ 
++def _apply_playback_speed(fig, multiplier: int) -> None:
++    """Speed up the Play button's frame rate without re-sampling the animation."""
++    frame_duration_ms = max(int(FRAME_DT * 1000 / multiplier), 1)
+     fig.update_layout(
+-        template="plotly_dark",
+-        title="Track map and line comparison",
+-        xaxis_title="X [m]",
+-        yaxis_title="Y [m]",
+-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+-        margin=dict(l=20, r=20, t=40, b=20),
+-        height=500,
+-        paper_bgcolor="#050b14",
+-        plot_bgcolor="#09131d",
+-        font=dict(color="#eaf2ff"),
+-    )
+-    fig.update_xaxes(scaleanchor="y", scaleratio=1, gridcolor="rgba(255,255,255,0.08)")
+-    fig.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
+-    return fig
+-
+-
+-def build_speed_heatmap(session: dict):
+-    z = np.vstack([session["predicted_speed"], session["actual_speed"]])
+-    fig = go.Figure(data=go.Heatmap(
+-        z=z,
+-        x=np.linspace(0, 1, len(session["predicted_speed"])),
+-        y=["Model", "Actual"],
+-        colorscale="Turbo",
+-        hovertemplate="Lap fraction: %{x:.2f}<br>Speed: %{z:.1f} m/s<extra></extra>",
+-    ))
+-    fig.update_layout(
+-        template="plotly_dark",
+-        title="Speed heatmap by lap segment",
+-        xaxis_title="Lap progress",
+-        yaxis_title="Signal",
+-        margin=dict(l=20, r=20, t=50, b=20),
+-        height=350,
+-        paper_bgcolor="#050b14",
+-        plot_bgcolor="#09131d",
+-        font=dict(color="#eaf2ff"),
+-        annotations=[
++        updatemenus=[
+             dict(
+-                text="Brighter colors = faster speed. Top row = physics model; bottom row = actual lap trace.",
+-                x=0.5,
+-                y=1.12,
+-                xref="paper",
+-                yref="paper",
+-                showarrow=False,
+-                font=dict(size=12, color="#dfeaff"),
+-                align="center",
++                type="buttons",
++                showactive=False,
++                x=0.05, y=1.12, xanchor="left", yanchor="top",
++                buttons=[
++                    dict(
++                        label="Play", method="animate",
++                        args=[None, {"frame": {"duration": frame_duration_ms, "redraw": True}, "fromcurrent": True, "transition": {"duration": 0}}],
++                    ),
++                    dict(
++                        label="Pause", method="animate",
++                        args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}],
++                    ),
++                ],
+             )
+-        ],
++        ]
+     )
+-    return fig
+ 
+ 
+ def main() -> None:
+-    st.set_page_config(page_title="Racing Line Live Demo", layout="wide")
+-    st.title("F1 Optimal Racing Line Live Demo")
+-    st.caption("Real-world telemetry path is supported when FastF1 data is available; synthetic track data is a fallback demo mode.")
++    st.set_page_config(page_title="Spa Racing Line", layout="wide")
++    st.title("F1 Racing Line Prediction - Spa-Francorchamps")
++    st.caption("2023 Race session: real FastF1 telemetry vs. a physics-informed ideal-line model.")
+ 
+-    with st.sidebar:
+-        st.header("Vehicle setup")
+-        data_mode = st.radio("Data source", ["Synthetic demo", "FastF1 telemetry"], index=0)
+-        track_name = st.selectbox("Track", options=list(TRACK_LIBRARY.keys()))
+-        car_name = st.selectbox("Car", options=list(CAR_PRESETS.keys()))
+-        st.caption("Preset tracks are stylized for the demo; real FastF1 sessions are used when available.")
+-
+-        if car_name == "Custom":
+-            mu = st.slider("Tyre friction coefficient μ", 1.0, 1.8, 1.35, step=0.01)
+-            downforce = st.slider("Downforce [N]", 1000, 6000, 3000, step=50)
+-            mass = st.slider("Vehicle mass [kg]", 600, 950, 800, step=10)
+-            amplitude = st.slider("Track amplitude", 0.6, 1.8, 1.0, step=0.05)
+-        else:
+-            setup = CAR_PRESETS[car_name]
+-            mu = setup["mu"]
+-            downforce = setup["downforce"]
+-            mass = setup["mass"]
+-            amplitude = 1.0
+-
+-    if data_mode == "FastF1 telemetry":
+-        telemetry = load_fastf1_session(circuit=track_name, year=2023, session_name="R")
+-        if telemetry.data.get("x") and telemetry.data.get("speed"):
+-            comparison = compare_session_to_model(
+-                {"x": telemetry.data["x"], "y": telemetry.data["y"], "speed": telemetry.data["speed"]},
+-                mu=mu,
+-                downforce=downforce,
+-                mass=mass,
+-            )
+-            session = {
+-                "x": np.asarray(telemetry.data["x"], dtype=float),
+-                "y": np.asarray(telemetry.data["y"], dtype=float),
+-                "actual_x": np.asarray(telemetry.data["x"], dtype=float),
+-                "actual_y": np.asarray(telemetry.data["y"], dtype=float),
+-                "predicted_speed": np.asarray(comparison["predicted_speed"], dtype=float),
+-                "actual_speed": np.asarray(comparison["actual_speed"], dtype=float),
+-                "curvature": np.asarray(comparison["curvature"], dtype=float),
+-                "apex_x": float(np.asarray(telemetry.data["x"]).mean()),
+-                "apex_y": float(np.asarray(telemetry.data["y"]).mean()),
+-                "track_name": telemetry.circuit,
+-            }
+-            st.success("FastF1 telemetry data loaded successfully for comparison.")
+-        else:
+-            st.warning("FastF1 data was not available in this environment. Falling back to the synthetic demo mode for the UI.")
+-            session = simulate_session(
+-                track_name=track_name,
+-                mu=mu,
+-                downforce=downforce,
+-                mass=mass,
+-                amplitude=amplitude,
+-            )
+-    else:
+-        session = simulate_session(
+-            track_name=track_name,
+-            mu=mu,
+-            downforce=downforce,
+-            mass=mass,
+-            amplitude=amplitude,
+-        )
+-
+-    metrics = {
+-        "Predicted apex speed": f"{session['predicted_speed'].max():.1f} m/s",
+-        "Mean speed": f"{session['predicted_speed'].mean():.1f} m/s",
+-        "Peak curvature": f"{session['curvature'].max():.3f}",
+-    }
++    pipeline = _load_pipeline()
++    if pipeline is None:
++        st.error("Could not load the 2023 Spa race session (FastF1 unavailable or no network access).")
++        return
++    session, vehicle, predicted_speed = pipeline
+ 
+-    cols = st.columns(3)
+-    for col, (label, value) in zip(cols, metrics.items()):
+-        col.metric(label, value)
+-
+-    st.subheader("Actual vs ideal lap")
+-    trajectory_progress = st.slider("Lap progress", 0, len(session["x"]) - 1, len(session["x"]) - 1, key="lap_progress", label_visibility="collapsed")
+-    st.plotly_chart(build_lap_figure(session, frame_index=trajectory_progress), use_container_width=True)
+-
+-    left, right = st.columns(2)
+-    with left:
+-        st.subheader("Speed heatmap")
+-        st.caption("Each row is one speed signal. Top = physics model, bottom = actual lap speed. Brighter colors indicate higher speeds.")
+-        st.plotly_chart(build_speed_heatmap(session), use_container_width=True)
+-    with right:
+-        st.subheader("Speed trace")
+-        speed_df = pd.DataFrame({
+-            "Lap progress": np.linspace(0, 1, len(session["predicted_speed"])),
+-            "Ideal speed": session["predicted_speed"],
+-            "Actual speed": session["actual_speed"],
+-        })
+-        st.line_chart(speed_df.set_index("Lap progress"))
+-
+-    st.caption(f"Track: {track_name} | Car: {car_name} | Setup: μ={mu:.2f}, downforce={downforce} N, mass={mass} kg")
++    driver_codes = sorted(session.drivers.keys())
++    leaderboard = build_leaderboard(session.drivers, session.s, predicted_speed)
++
++    with st.sidebar:
++        st.header("View options")
++        driver_code = st.selectbox("Driver", options=driver_codes, index=driver_codes.index(session.reference_driver))
++        show_ghost = st.checkbox("Show model ghost", value=False)
++        playback_label = st.radio("Playback speed", options=list(PLAYBACK_MULTIPLIERS.keys()), index=1, horizontal=True)
++        st.caption(f"Calibrated: \u03bc={vehicle.mu:.2f}, mass={vehicle.mass:.0f} kg")
++
++    fig = build_animated_lap(
++        session,
++        driver_code,
++        model_speed=predicted_speed if show_ghost else None,
++        frame_dt=FRAME_DT,
++    )
++    _apply_playback_speed(fig, PLAYBACK_MULTIPLIERS[playback_label])
++    st.plotly_chart(fig, use_container_width=True)
++
++    st.subheader("Leaderboard - time delta vs. the model")
++    leaderboard_rows = [
++        {
++            "Driver": comparison.driver,
++            "Lap Time (s)": round(session.drivers[comparison.driver].lap_time, 3),
++            "\u0394 vs Model (s)": round(comparison.total_delta_t, 3),
++            "RMSE (m/s)": round(comparison.rmse, 2),
++        }
++        for comparison in leaderboard
++    ]
++    leaderboard_df = pd.DataFrame(leaderboard_rows)
++
++    def _highlight_selected(row: pd.Series) -> list[str]:
++        is_selected = row["Driver"] == driver_code
++        return ["background-color: #1d3a5f" if is_selected else "" for _ in row]
++
++    st.dataframe(leaderboard_df.style.apply(_highlight_selected, axis=1), use_container_width=True, hide_index=True)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/docs/diagrams/architecture.html b/docs/diagrams/architecture.html
+new file mode 100644
+index 0000000..dde0634
+--- /dev/null
++++ b/docs/diagrams/architecture.html
+@@ -0,0 +1,267 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="UTF-8" />
++<title>Racing Line PINN — Architecture Diagram</title>
++<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
++<style>
++  body {
++    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
++    background: #0d1622;
++    color: #eaf2ff;
++    margin: 0;
++    padding: 24px;
++  }
++  h1 {
++    font-size: 1.3rem;
++    font-weight: 600;
++    margin-bottom: 4px;
++  }
++  p.subtitle {
++    margin-top: 0;
++    color: #9fb3cc;
++    font-size: 0.9rem;
++  }
++  .toolbar {
++    margin: 12px 0 20px;
++  }
++  button {
++    background: #1a2a3d;
++    color: #eaf2ff;
++    border: 1px solid rgba(255,255,255,0.15);
++    border-radius: 6px;
++    padding: 8px 14px;
++    cursor: pointer;
++    font-size: 0.9rem;
++  }
++  button:hover {
++    background: #24374d;
++  }
++  .diagram-wrap {
++    background: #050b14;
++    border: 1px solid rgba(255,255,255,0.08);
++    border-radius: 10px;
++    padding: 24px;
++    overflow: auto;
++  }
++  .legend-swatch {
++    display: inline-block;
++    width: 12px;
++    height: 12px;
++    border-radius: 3px;
++    margin-right: 4px;
++    vertical-align: middle;
++  }
++  .legend-swatch.existing {
++    background: #1a2a3d;
++    border: 1px solid rgba(255,255,255,0.3);
++  }
++  .legend-swatch.planned {
++    background: #3a2f10;
++    border: 1px dashed #f5a623;
++  }
++  .legend-swatch.deprecated {
++    background: #3a1010;
++    border: 1px dashed #ff4d4d;
++  }
++  table.matrix {
++    border-collapse: collapse;
++    width: 100%;
++    margin-top: 12px;
++    font-size: 0.88rem;
++  }
++  table.matrix th, table.matrix td {
++    border: 1px solid rgba(255,255,255,0.12);
++    padding: 10px 12px;
++    text-align: left;
++    vertical-align: top;
++  }
++  table.matrix th {
++    background: #14202f;
++    color: #f2f5fb;
++  }
++  table.matrix td {
++    background: rgba(18,30,43,0.6);
++  }
++  @media print {
++    .toolbar { display: none; }
++    body { background: #fff; color: #000; }
++    .diagram-wrap { border: none; background: #fff; }
++    table.matrix th, table.matrix td { color: #000; background: #fff; }
++  }
++</style>
++</head>
++<body>
++  <h1>Racing Line PINN — Architecture Diagram</h1>
++  <p class="subtitle">
++    Module and dependency graph for app.py and the racing_line_pinn package.<br/>
++    <span class="legend-swatch existing"></span> Implemented &nbsp;&nbsp;
++    <span class="legend-swatch planned"></span> Planned extension (not yet implemented) &nbsp;&nbsp;
++    <span class="legend-swatch deprecated"></span> To be replaced
++  </p>
++  <div class="toolbar">
++    <button onclick="window.print()">Print / Export as PDF</button>
++  </div>
++  <div class="diagram-wrap">
++    <pre class="mermaid">
++graph TD
++    subgraph UI["Streamlit UI"]
++        APP["app.py"]
++        AEROUI["Aero setup sliders:<br/>C_L (downforce), C_D (drag)"]
++        CACHE["@st.cache_data / @st.cache_resource<br/>isolate UI reruns"]
++
++        SPEEDTRACE_OLD["Speed trace (current)<br/>single chart, spiking artifacts"]
++        HEATMAP_OLD["Speed heatmap (current)<br/>2-row color heatmap"]
++        TRACKMAP_OLD["Lap figure (current)<br/>unaligned coordinate plot"]
++
++        SPEEDSPLIT["Subplot 1: Speed<br/>v_Actual vs v_PINN"]
++        DELTATIME["Subplot 2: Δt(s)<br/>continuous time-loss curve"]
++        GG["build_gg_diagram()<br/>G-G scatter, dynamic friction envelope"]
++        TRACKMAP_NEW["Rotated track map<br/>color-coded by Δv(s), scaleanchor='x'"]
++        DELTA["build_delta_traces()<br/>Δv(s), Δt(s) vs driver"]
++    end
++
++    subgraph PKG["racing_line_pinn package"]
++        INIT["__init__.py (public API)"]
++        LIVE["live_demo.py<br/>TRACK_LIBRARY, CAR_PRESETS,<br/>simulate_session()"]
++        REALDATA["real_data.py<br/>load_fastf1_session()"]
++        NORM["normalize_and_rotate()<br/>decimeter to meter,<br/>PCA/rotation so straights are horizontal"]
++        FRENET["frenet.py<br/>cartesian_to_frenet(s, d)"]
++        BOUNDS["track boundary extrusion<br/>W(s), |d(s)| &lt;= W(s)/2"]
++        SESSAN["session_analysis.py<br/>compare_session_to_model()"]
++        COMPARE["compare.py<br/>calculate_speed_metrics()"]
++        PHYSICS["physics.py<br/>compute_racing_line_target_speed()"]
++        AEROLOAD["downforce-dependent load limits<br/>F_z = mg + 1/2 rho C_L A v^2"]
++        PACEJKA["Pacejka combined friction ellipse<br/>a_lat = v^2 kappa, a_long = v dv/ds"]
++        WEIGHTXFER["two-track weight transfer<br/>delta F_z per wheel"]
++        DATASET["dataset.py<br/>generate_synthetic_track_samples()"]
++        MODEL["model.py<br/>RacingLinePINN, physics_loss()"]
++        LOSSEXT["multi-term loss:<br/>lap time integral(1/v ds)<br/>+ friction/limit ReLU penalties"]
++        TRAIN["training.py<br/>train_model(), predict_speed()"]
++        CLI["cli.py<br/>CLI entrypoint"]
++        REPORT["reporting.py<br/>build_report()"]
++        VIZ["visualization.py<br/>plot_racing_line_comparison()"]
++        TELEM["telemetry.py<br/>synthetic track/telemetry gen"]
++    end
++
++    subgraph EXT["External dependencies"]
++        ST["streamlit"]
++        PLOTLY["plotly"]
++        TORCH["torch"]
++        NP["numpy / pandas"]
++        MPL["matplotlib"]
++        FASTF1["fastf1 (optional)"]
++    end
++
++    APP --> ST
++    APP --> PLOTLY
++    APP --> COMPARE
++    APP --> LIVE
++    APP --> REALDATA
++    APP --> SESSAN
++    APP --> AEROUI
++    APP --> CACHE
++    APP --> SPEEDTRACE_OLD
++    APP --> HEATMAP_OLD
++    APP --> TRACKMAP_OLD
++    SPEEDTRACE_OLD -.replaced by.-> SPEEDSPLIT
++    SPEEDTRACE_OLD -.replaced by.-> DELTATIME
++    HEATMAP_OLD -.replaced by.-> GG
++    TRACKMAP_OLD -.replaced by.-> TRACKMAP_NEW
++    APP --> DELTA
++    CACHE -.wraps.-> REALDATA
++    CACHE -.wraps.-> TRAIN
++    AEROUI --> AEROLOAD
++    GG --> PACEJKA
++    DELTA --> SESSAN
++    SPEEDSPLIT --> SESSAN
++    DELTATIME --> SESSAN
++    TRACKMAP_NEW --> SESSAN
++
++    REALDATA --> NORM
++    NORM --> FRENET
++    FRENET --> BOUNDS
++    BOUNDS --> SESSAN
++
++    LIVE --> PHYSICS
++    LIVE --> NP
++    SESSAN --> PHYSICS
++    SESSAN --> NP
++    REALDATA --> FASTF1
++
++    PHYSICS --> AEROLOAD
++    PHYSICS --> PACEJKA
++    PHYSICS --> WEIGHTXFER
++    DATASET --> PHYSICS
++    DATASET --> TORCH
++    TRAIN --> DATASET
++    TRAIN --> MODEL
++    MODEL --> TORCH
++    MODEL --> LOSSEXT
++    CLI --> TRAIN
++
++    REPORT --> COMPARE
++    COMPARE --> NP
++    VIZ --> MPL
++    TELEM --> NP
++
++    INIT -.exports.-> COMPARE
++    INIT -.exports.-> DATASET
++    INIT -.exports.-> PHYSICS
++    INIT -.exports.-> REALDATA
++    INIT -.exports.-> REPORT
++    INIT -.exports.-> SESSAN
++    INIT -.exports.-> TRAIN
++
++    classDef planned fill:#3a2f10,stroke:#f5a623,stroke-width:2px,stroke-dasharray: 4 3,color:#ffe0a3;
++    classDef deprecated fill:#3a1010,stroke:#ff4d4d,stroke-width:2px,stroke-dasharray: 2 2,color:#ffb3b3;
++    class AEROUI,CACHE,GG,DELTA,SPEEDSPLIT,DELTATIME,TRACKMAP_NEW,NORM,FRENET,BOUNDS,AEROLOAD,PACEJKA,WEIGHTXFER,LOSSEXT planned
++    class SPEEDTRACE_OLD,HEATMAP_OLD,TRACKMAP_OLD deprecated
++    </pre>
++  </div>
++
++  <h2 style="font-size:1.1rem;margin-top:32px;">Implementation Target Matrix</h2>
++  <p class="subtitle">
++    Current output graphs (red, dashed) are considered worthless and are slated for full replacement — not incremental extension.
++  </p>
++  <table class="matrix">
++    <thead>
++      <tr>
++        <th>Target Component</th>
++        <th>Old Implementation</th>
++        <th>New Replacement</th>
++        <th>Benefit</th>
++      </tr>
++    </thead>
++    <tbody>
++      <tr>
++        <td>Speed Trace</td>
++        <td>Single chart with spiking artifact curves</td>
++        <td>Subplot 1: Speed (v<sub>Actual</sub> vs. v<sub>PINN</sub>)</td>
++        <td>Eliminates scaling anomalies and clarifies speed gaps</td>
++      </tr>
++      <tr>
++        <td>Delta Time</td>
++        <td>None</td>
++        <td>Subplot 2: continuous Δt(s) curve in seconds</td>
++        <td>Quantifies time loss per corner/sector</td>
++      </tr>
++      <tr>
++        <td>Grip Limits</td>
++        <td>2-row color heatmap</td>
++        <td>G–G scatter plot with dynamic friction envelope</td>
++        <td>Displays brake/cornering traction envelope usage</td>
++      </tr>
++      <tr>
++        <td>Track Map</td>
++        <td>Unaligned coordinate plot</td>
++        <td>Rotated 2D line map color-coded by speed delta Δv</td>
++        <td>Shows spatial time loss directly on track geometry</td>
++      </tr>
++    </tbody>
++  </table>
++  <script>
++    mermaid.initialize({ startOnLoad: true, theme: "dark" });
++  </script>
++</body>
++</html>
+diff --git a/docs/diagrams/state_flow.html b/docs/diagrams/state_flow.html
+new file mode 100644
+index 0000000..e5fc646
+--- /dev/null
++++ b/docs/diagrams/state_flow.html
+@@ -0,0 +1,209 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="UTF-8" />
++<title>Racing Line PINN — App State Flow Diagram</title>
++<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
++<style>
++  body {
++    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
++    background: #0d1622;
++    color: #eaf2ff;
++    margin: 0;
++    padding: 24px;
++  }
++  h1 {
++    font-size: 1.3rem;
++    font-weight: 600;
++    margin-bottom: 4px;
++  }
++  p.subtitle {
++    margin-top: 0;
++    color: #9fb3cc;
++    font-size: 0.9rem;
++  }
++  .toolbar {
++    margin: 12px 0 20px;
++  }
++  button {
++    background: #1a2a3d;
++    color: #eaf2ff;
++    border: 1px solid rgba(255,255,255,0.15);
++    border-radius: 6px;
++    padding: 8px 14px;
++    cursor: pointer;
++    font-size: 0.9rem;
++  }
++  button:hover {
++    background: #24374d;
++  }
++  .diagram-wrap {
++    background: #050b14;
++    border: 1px solid rgba(255,255,255,0.08);
++    border-radius: 10px;
++    padding: 24px;
++    overflow: auto;
++  }
++  .legend-swatch {
++    display: inline-block;
++    width: 12px;
++    height: 12px;
++    border-radius: 3px;
++    margin-right: 4px;
++    vertical-align: middle;
++  }
++  .legend-swatch.existing {
++    background: #1a2a3d;
++    border: 1px solid rgba(255,255,255,0.3);
++  }
++  .legend-swatch.planned {
++    background: #3a2f10;
++    border: 1px dashed #f5a623;
++  }
++  .legend-swatch.deprecated {
++    background: #3a1010;
++    border: 1px dashed #ff4d4d;
++  }
++  table.matrix {
++    border-collapse: collapse;
++    width: 100%;
++    margin-top: 12px;
++    font-size: 0.88rem;
++  }
++  table.matrix th, table.matrix td {
++    border: 1px solid rgba(255,255,255,0.12);
++    padding: 10px 12px;
++    text-align: left;
++    vertical-align: top;
++  }
++  table.matrix th {
++    background: #14202f;
++    color: #f2f5fb;
++  }
++  table.matrix td {
++    background: rgba(18,30,43,0.6);
++  }
++  @media print {
++    .toolbar { display: none; }
++    body { background: #fff; color: #000; }
++    .diagram-wrap { border: none; background: #fff; }
++    table.matrix th, table.matrix td { color: #000; background: #fff; }
++  }
++</style>
++</head>
++<body>
++  <h1>Racing Line PINN — App State Flow Diagram</h1>
++  <p class="subtitle">
++    Streamlit reruns the whole script on every widget interaction; this shows the resulting execution states in app.py.<br/>
++    <span class="legend-swatch existing"></span> Implemented &nbsp;&nbsp;
++    <span class="legend-swatch planned"></span> Planned extension (not yet implemented) &nbsp;&nbsp;
++    <span class="legend-swatch deprecated"></span> To be replaced
++  </p>
++  <div class="toolbar">
++    <button onclick="window.print()">Print / Export as PDF</button>
++  </div>
++  <div class="diagram-wrap">
++    <pre class="mermaid">
++stateDiagram-v2
++    [*] --> ScriptStart : user opens/interacts with app
++    note left of ScriptStart
++        (planned) @st.cache_resource wraps
++        PyTorch model loading
++    end note
++
++    ScriptStart --> SidebarConfig : render sidebar widgets\n(data_mode, track, car, sliders,\n(planned) aero C_L/C_D sliders)
++
++    SidebarConfig --> DataModeBranch : read selected data_mode
++
++    state DataModeBranch &lt;&lt;choice&gt;&gt;
++    DataModeBranch --> FastF1CacheCheck : "FastF1 telemetry"
++    DataModeBranch --> SimulateSynthetic : "Synthetic demo"
++
++    state FastF1CacheCheck &lt;&lt;choice&gt;&gt;
++    note right of FastF1CacheCheck : (planned) @st.cache_data
++    FastF1CacheCheck --> LoadFastF1 : cache miss
++    FastF1CacheCheck --> FastF1DataCheck : cache hit
++
++    LoadFastF1 --> FastF1DataCheck : load_fastf1_session()
++
++    state FastF1DataCheck &lt;&lt;choice&gt;&gt;
++    FastF1DataCheck --> NormalizeRotate : x & speed present
++    FastF1DataCheck --> FallbackWarning : data missing/empty
++
++    NormalizeRotate --> ConvertToFrenet : (planned) center dm to m,\nPCA rotation so straights are horizontal
++    ConvertToFrenet --> ComputeTrackBoundaries : (planned) cartesian (X,Y) to (s, d)
++    ComputeTrackBoundaries --> CompareToModel : (planned) derive W(s),\n|d(s)| <= W(s)/2
++
++    CompareToModel --> BuildSessionFromTelemetry : compare_session_to_model()
++    BuildSessionFromTelemetry --> ShowSuccessMsg
++
++    FallbackWarning --> SimulateSynthetic : show warning, use synthetic
++
++    SimulateSynthetic --> SessionReady : simulate_session()
++    ShowSuccessMsg --> SessionReady
++
++    SessionReady --> ComputeMetrics : max/mean speed, peak curvature\n(planned) downforce load limit,\nPacejka G-G, weight transfer
++    ComputeMetrics --> RenderMetricCards
++
++    note right of RenderMetricCards
++        (planned) current speed trace, heatmap,
++        and lap figure are fully replaced below,
++        not extended
++    end note
++
++    RenderMetricCards --> RenderTrackMap : slider = lap progress\n(planned) rotated map color-coded by delta v(s),\naspect locked scaleanchor='x'\nreplaces unaligned lap figure
++    RenderTrackMap --> RenderGGDiagram : (planned) G-G scatter with dynamic\nfriction envelope; replaces 2-row heatmap
++    RenderGGDiagram --> RenderSpeedSubplot : (planned) subplot 1: v_Actual vs v_PINN;\nreplaces single spiking speed chart
++    RenderSpeedSubplot --> RenderDeltaTimeSubplot : (planned) subplot 2: continuous delta t(s);\nno prior equivalent
++    RenderDeltaTimeSubplot --> RenderCaption
++    RenderCaption --> Idle
++
++    Idle --> ScriptStart : any widget change\n(slider/select/radio)\ntriggers full rerun\n(planned) cached resources persist
++    </pre>
++  </div>
++
++  <h2 style="font-size:1.1rem;margin-top:32px;">Implementation Target Matrix</h2>
++  <p class="subtitle">
++    Current output graphs (red, dashed) are considered worthless and are slated for full replacement — not incremental extension.
++  </p>
++  <table class="matrix">
++    <thead>
++      <tr>
++        <th>Target Component</th>
++        <th>Old Implementation</th>
++        <th>New Replacement</th>
++        <th>Benefit</th>
++      </tr>
++    </thead>
++    <tbody>
++      <tr>
++        <td>Speed Trace</td>
++        <td>Single chart with spiking artifact curves</td>
++        <td>Subplot 1: Speed (v<sub>Actual</sub> vs. v<sub>PINN</sub>)</td>
++        <td>Eliminates scaling anomalies and clarifies speed gaps</td>
++      </tr>
++      <tr>
++        <td>Delta Time</td>
++        <td>None</td>
++        <td>Subplot 2: continuous Δt(s) curve in seconds</td>
++        <td>Quantifies time loss per corner/sector</td>
++      </tr>
++      <tr>
++        <td>Grip Limits</td>
++        <td>2-row color heatmap</td>
++        <td>G–G scatter plot with dynamic friction envelope</td>
++        <td>Displays brake/cornering traction envelope usage</td>
++      </tr>
++      <tr>
++        <td>Track Map</td>
++        <td>Unaligned coordinate plot</td>
++        <td>Rotated 2D line map color-coded by speed delta Δv</td>
++        <td>Shows spatial time loss directly on track geometry</td>
++      </tr>
++    </tbody>
++  </table>
++  <script>
++    mermaid.initialize({ startOnLoad: true, theme: "dark" });
++  </script>
++</body>
++</html>
+diff --git a/pyproject.toml b/pyproject.toml
+index 6f72160..6ba0b4d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -10,12 +10,13 @@ readme = "README.md"
+ requires-python = ">=3.11"
+ dependencies = [
+     "numpy>=1.26",
+-    "matplotlib>=3.8",
+     "pandas>=2.1",
+     "torch>=2.2",
+     "pytest>=8.0",
+     "scipy>=1.11",
+     "streamlit>=1.36",
++    "plotly>=5.20",
++    "fastf1>=3.0.0",
+ ]
+ 
+ [project.scripts]
+diff --git a/requirements.txt b/requirements.txt
+index 054ce05..90742c1 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,8 +1,8 @@
+ numpy>=1.26
+-matplotlib>=3.8
+ pandas>=2.1
+ torch>=2.2
+ pytest>=8.0
+ scipy>=1.11
+ streamlit>=1.36
+ fastf1>=3.0.0
++plotly>=5.20
+diff --git a/scripts/generate_demo.py b/scripts/generate_demo.py
+deleted file mode 100644
+index 20a3c66..0000000
+--- a/scripts/generate_demo.py
++++ /dev/null
+@@ -1,29 +0,0 @@
+-from __future__ import annotations
+-
+-import sys
+-from pathlib import Path
+-
+-ROOT = Path(__file__).resolve().parents[1]
+-SRC = ROOT / "src"
+-if str(SRC) not in sys.path:
+-    sys.path.insert(0, str(SRC))
+-
+-from racing_line_pinn.telemetry import generate_telemetry_track, generate_track_geometry
+-from racing_line_pinn.visualization import plot_racing_line_comparison
+-
+-
+-def main():
+-    x, y, curvature = generate_track_geometry(220)
+-    telemetry = generate_telemetry_track(x, y, ideal_offset=0.05)
+-    output_path = plot_racing_line_comparison(
+-        telemetry["actual"]["x"],
+-        telemetry["actual"]["y"],
+-        telemetry["ideal"]["x"],
+-        telemetry["ideal"]["y"],
+-        save_path="outputs/racing_line_comparison.png",
+-    )
+-    print(f"Saved visualization to: {output_path}")
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/src/racing_line_pinn/__init__.py b/src/racing_line_pinn/__init__.py
+index b0deb3e..3743b8f 100644
+--- a/src/racing_line_pinn/__init__.py
++++ b/src/racing_line_pinn/__init__.py
+@@ -1,30 +1,59 @@
+ """Physics-informed racing line prediction package."""
+ 
+-from .compare import calculate_speed_metrics, synthesize_driver_trajectory
+-from .dataset import generate_synthetic_track_samples
++from .calibration import VehicleParams, calibrate_vehicle_params, load_vehicle_params, save_vehicle_params
++from .dataset import build_training_samples
++from .evaluation import (
++    DriverComparison,
++    build_leaderboard,
++    calculate_speed_metrics,
++    compare_driver_to_model,
++    compute_delta_traces,
++)
++from .frenet import cartesian_to_frenet, estimate_track_width, normalize_and_rotate
+ from .physics import (
++    calculate_aero_downforce,
++    calculate_aero_drag,
+     calculate_lateral_grip_limit,
++    calculate_speed_dependent_normal_load,
+     compute_corner_speed_limit,
+     compute_racing_line_target_speed,
++    compute_target_speed_with_aero,
++    compute_two_track_weight_transfer,
++    distribute_wheel_loads,
++    pacejka_combined_friction_limit,
+ )
+-from .real_data import TelemetrySession, load_fastf1_session
+-from .reporting import ComparisonReport, build_report
+-from .session_analysis import compare_session_to_model, estimate_curvature_from_xy
++from .real_data import DriverLapData, SpaSessionData, load_spa_race_session
+ from .training import predict_speed, train_model
++from .visualization import build_animated_lap
+ 
+ __all__ = [
+     "calculate_lateral_grip_limit",
+     "compute_corner_speed_limit",
+     "compute_racing_line_target_speed",
+-    "generate_synthetic_track_samples",
++    "calculate_aero_downforce",
++    "calculate_aero_drag",
++    "calculate_speed_dependent_normal_load",
++    "pacejka_combined_friction_limit",
++    "compute_two_track_weight_transfer",
++    "distribute_wheel_loads",
++    "compute_target_speed_with_aero",
++    "cartesian_to_frenet",
++    "estimate_track_width",
++    "normalize_and_rotate",
++    "build_training_samples",
+     "train_model",
+     "predict_speed",
+     "calculate_speed_metrics",
+-    "synthesize_driver_trajectory",
+-    "TelemetrySession",
+-    "load_fastf1_session",
+-    "ComparisonReport",
+-    "build_report",
+-    "estimate_curvature_from_xy",
+-    "compare_session_to_model",
++    "compute_delta_traces",
++    "compare_driver_to_model",
++    "build_leaderboard",
++    "DriverComparison",
++    "DriverLapData",
++    "SpaSessionData",
++    "load_spa_race_session",
++    "VehicleParams",
++    "calibrate_vehicle_params",
++    "save_vehicle_params",
++    "load_vehicle_params",
++    "build_animated_lap",
+ ]
+diff --git a/src/racing_line_pinn/calibration.py b/src/racing_line_pinn/calibration.py
+new file mode 100644
+index 0000000..7badd70
+--- /dev/null
++++ b/src/racing_line_pinn/calibration.py
+@@ -0,0 +1,189 @@
++"""Vehicle parameter calibration from pooled real multi-driver telemetry.
++
++Fits tyre friction (``mu``) and lumped aero coefficient-areas against the
++physics relations in :mod:`racing_line_pinn.physics`, using every driver's
++resampled speed/curvature samples from a single :class:`SpaSessionData`
++(see :mod:`racing_line_pinn.real_data`). The result is a constant
++:class:`VehicleParams` reused everywhere downstream -- there are no
++user-tunable sliders.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from dataclasses import asdict, dataclass
++
++import numpy as np
++from scipy.optimize import least_squares
++from scipy.signal import savgol_filter
++
++from .physics import (
++    calculate_aero_drag,
++    calculate_speed_dependent_normal_load,
++    pacejka_combined_friction_limit,
++)
++from .real_data import SpaSessionData
++
++MASS_KG = 798.0  # FIA 2023 minimum car+driver weight; not observable from telemetry
++APEX_CURVATURE_PERCENTILE = 80.0
++STRAIGHT_CURVATURE_PERCENTILE = 25.0
++DERIVATIVE_PERCENTILE = 95.0
++DEFAULT_PARAMS_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "outputs", "vehicle_params.json")
++
++
++@dataclass
++class VehicleParams:
++    """Calibrated vehicle constants shared by every training/evaluation step."""
++
++    mu: float
++    aero_lift_area: float
++    aero_drag_area: float
++    max_accel: float
++    max_decel: float
++    mass: float = MASS_KG
++
++
++def _smoothed_longitudinal_accel(s: np.ndarray, speed: np.ndarray) -> np.ndarray:
++    """Return a_long(s) = v * dv/ds from a savgol-smoothed speed trace."""
++    window = min(15, speed.size)
++    if window % 2 == 0:
++        window -= 1
++    speed_smooth = savgol_filter(speed, window_length=window, polyorder=3) if window >= 5 else speed
++    dv_ds = np.gradient(speed_smooth, s)
++    return speed_smooth * dv_ds
++
++
++def _pool_apex_samples(session: SpaSessionData, percentile: float) -> tuple[np.ndarray, np.ndarray]:
++    """Pool (curvature, speed) across all drivers at the highest-curvature track points."""
++    curvature = np.abs(session.curvature)
++    threshold = np.percentile(curvature, percentile)
++    mask = curvature >= threshold
++
++    kappas = []
++    speeds = []
++    for lap in session.drivers.values():
++        kappas.append(curvature[mask])
++        speeds.append(lap.speed[mask])
++    return np.concatenate(kappas), np.concatenate(speeds)
++
++
++def _fit_mu_and_lift_area(curvature_apex: np.ndarray, speed_apex: np.ndarray, mass: float) -> tuple[float, float]:
++    """Fit (mu, lumped C_L*A) so the Pacejka grip limit matches observed apex lateral accel."""
++    radius = 1.0 / np.maximum(curvature_apex, 1e-6)
++    observed_lateral_accel = speed_apex ** 2 / radius
++
++    def residuals(params: np.ndarray) -> np.ndarray:
++        mu, lift_area = params
++        predicted = np.empty_like(speed_apex)
++        for i, v in enumerate(speed_apex):
++            normal_force = calculate_speed_dependent_normal_load(mass, float(v), 1.0, lift_area)
++            predicted[i] = pacejka_combined_friction_limit(mu, normal_force, mass, long_accel=0.0)
++        return observed_lateral_accel - predicted
++
++    result = least_squares(residuals, x0=[1.6, 3.0], bounds=([0.3, 1e-3], [3.0, 10.0]))
++    mu, lift_area = result.x
++    return float(mu), float(lift_area)
++
++
++def _pool_longitudinal_samples(
++    session: SpaSessionData, straight_percentile: float
++) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
++    """Pool smoothed longitudinal accel/decel samples, plus straight-line accel-phase speeds."""
++    curvature = np.abs(session.curvature)
++    straight_threshold = np.percentile(curvature, straight_percentile)
++    straight_mask = curvature <= straight_threshold
++
++    accel_values = []
++    decel_values = []
++    straight_speeds = []
++    straight_accel = []
++    for lap in session.drivers.values():
++        a_long = _smoothed_longitudinal_accel(session.s, lap.speed)
++        accel_phase = a_long > 0
++        decel_phase = a_long < 0
++
++        accel_values.append(a_long[accel_phase])
++        decel_values.append(np.abs(a_long[decel_phase]))
++
++        straight_accel_phase = accel_phase & straight_mask
++        straight_speeds.append(lap.speed[straight_accel_phase])
++        straight_accel.append(a_long[straight_accel_phase])
++
++    return (
++        np.concatenate(accel_values),
++        np.concatenate(decel_values),
++        np.concatenate(straight_speeds),
++        np.concatenate(straight_accel),
++    )
++
++
++def _fit_drag_area(speeds: np.ndarray, observed_accel: np.ndarray, max_accel: float, mass: float) -> float:
++    """Fit the lumped C_D*A so max_accel - drag_decel(v) matches straight-line accel-phase data."""
++    if speeds.size < 5:
++        return 1.5  # not enough straight-line variation to identify drag; fall back to a plausible default
++
++    def residuals(params: np.ndarray) -> np.ndarray:
++        drag_area = params[0]
++        predicted = max_accel - calculate_aero_drag(speeds, 1.0, drag_area) / mass
++        return observed_accel - predicted
++
++    result = least_squares(residuals, x0=[1.5], bounds=([1e-3], [10.0]))
++    return float(result.x[0])
++
++
++def calibrate_vehicle_params(
++    session: SpaSessionData,
++    mass: float = MASS_KG,
++    apex_percentile: float = APEX_CURVATURE_PERCENTILE,
++    straight_percentile: float = STRAIGHT_CURVATURE_PERCENTILE,
++    derivative_percentile: float = DERIVATIVE_PERCENTILE,
++) -> VehicleParams:
++    """Calibrate shared vehicle parameters from pooled real multi-driver telemetry.
++
++    ``mu`` and the lumped downforce coefficient-area are fit against near-apex
++    (high-curvature) samples, where drivers are assumed to be at the lateral
++    grip limit. ``max_accel``/``max_decel`` are the given percentile (default
++    95th) of smoothed longitudinal accel/decel pooled across all drivers,
++    robust to outlier spikes. The lumped drag coefficient-area is then fit
++    against straight-line acceleration-phase samples, holding ``max_accel``
++    fixed. Mass is fixed (not observable from telemetry), per the 2023 FIA
++    minimum car+driver weight.
++    """
++    if not session.drivers:
++        raise ValueError("session has no driver lap data to calibrate from.")
++
++    curvature_apex, speed_apex = _pool_apex_samples(session, apex_percentile)
++    mu, aero_lift_area = _fit_mu_and_lift_area(curvature_apex, speed_apex, mass)
++
++    accel_values, decel_values, straight_speeds, straight_accel = _pool_longitudinal_samples(
++        session, straight_percentile
++    )
++    max_accel = float(np.percentile(accel_values, derivative_percentile)) if accel_values.size else 8.0
++    max_decel = float(np.percentile(decel_values, derivative_percentile)) if decel_values.size else 30.0
++    aero_drag_area = _fit_drag_area(straight_speeds, straight_accel, max_accel, mass)
++
++    return VehicleParams(
++        mu=mu,
++        aero_lift_area=aero_lift_area,
++        aero_drag_area=aero_drag_area,
++        max_accel=max_accel,
++        max_decel=max_decel,
++        mass=mass,
++    )
++
++
++def save_vehicle_params(params: VehicleParams, path: str = DEFAULT_PARAMS_PATH) -> None:
++    """Persist calibrated params to JSON so they're computed once and reused as constants."""
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w", encoding="utf-8") as handle:
++        json.dump(asdict(params), handle, indent=2)
++
++
++def load_vehicle_params(path: str = DEFAULT_PARAMS_PATH) -> VehicleParams | None:
++    """Load previously persisted calibrated params, or ``None`` if not yet computed."""
++    if not os.path.exists(path):
++        return None
++    with open(path, "r", encoding="utf-8") as handle:
++        data = json.load(handle)
++    return VehicleParams(**data)
+diff --git a/src/racing_line_pinn/cli.py b/src/racing_line_pinn/cli.py
+index d7e7d39..b82e80b 100644
+--- a/src/racing_line_pinn/cli.py
++++ b/src/racing_line_pinn/cli.py
+@@ -4,22 +4,74 @@ from __future__ import annotations
+ 
+ import argparse
+ 
++import numpy as np
++
++from .calibration import calibrate_vehicle_params, load_vehicle_params, save_vehicle_params
++from .evaluation import build_leaderboard
++from .real_data import load_spa_race_session
+ from .training import train_model
+ 
+ 
++def _lap_time_from_speed(s: np.ndarray, speed: np.ndarray) -> float:
++    """Trapezoidal-integrate 1/v ds over a speed trace to estimate elapsed time."""
++    inv_speed = 1.0 / np.clip(speed, 1.0, None)
++    return float(np.trapezoid(inv_speed, s))
++
++
+ def build_parser() -> argparse.ArgumentParser:
+-    parser = argparse.ArgumentParser(description="Train and evaluate a physics-informed F1 racing-line estimator.")
++    parser = argparse.ArgumentParser(
++        description="Train the physics-informed Spa ideal-line model and print a driver leaderboard."
++    )
+     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs.")
+     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+     parser.add_argument("--hidden-dim", type=int, default=64, help="Hidden layer size.")
++    parser.add_argument("--year", type=int, default=2023, help="Season year.")
++    parser.add_argument("--session", type=str, default="R", help="Session identifier (e.g. R for Race).")
++    parser.add_argument(
++        "--recalibrate", action="store_true", help="Recompute vehicle params even if a cached JSON exists."
++    )
+     return parser
+ 
+ 
+ def main() -> None:
+     args = build_parser().parse_args()
+-    model = train_model(epochs=args.epochs, learning_rate=args.lr, hidden_dim=args.hidden_dim)
+-    print(f"Model trained successfully: {type(model).__name__}")
++
++    session = load_spa_race_session(year=args.year, session_name=args.session)
++    if session is None:
++        print("Could not load Spa session data (FastF1 unavailable or network restricted).")
++        return
++
++    vehicle = None if args.recalibrate else load_vehicle_params()
++    if vehicle is None:
++        vehicle = calibrate_vehicle_params(session)
++        save_vehicle_params(vehicle)
++    print(
++        f"Vehicle params: mu={vehicle.mu:.3f}, aero_lift_area={vehicle.aero_lift_area:.3f}, "
++        f"aero_drag_area={vehicle.aero_drag_area:.3f}, max_accel={vehicle.max_accel:.2f}, "
++        f"max_decel={vehicle.max_decel:.2f}"
++    )
++
++    model, predicted_speed = train_model(
++        session.s,
++        session.curvature,
++        vehicle,
++        epochs=args.epochs,
++        learning_rate=args.lr,
++        hidden_dim=args.hidden_dim,
++    )
++    model_lap_time = _lap_time_from_speed(session.s, predicted_speed.numpy())
++    print(f"\nModel ideal lap time: {model_lap_time:.3f}s ({type(model).__name__})")
++
++    leaderboard = build_leaderboard(session.drivers, session.s, predicted_speed.numpy())
++
++    print(f"\n{'Driver':<8}{'LapTime':>10}{'Delta vs model':>18}{'RMSE':>10}")
++    for comparison in leaderboard:
++        lap_time = session.drivers[comparison.driver].lap_time
++        print(
++            f"{comparison.driver:<8}{lap_time:>10.3f}{comparison.total_delta_t:>+18.3f}{comparison.rmse:>10.2f}"
++        )
+ 
+ 
+ if __name__ == "__main__":
+     main()
++
+diff --git a/src/racing_line_pinn/compare.py b/src/racing_line_pinn/compare.py
+deleted file mode 100644
+index 6d44462..0000000
+--- a/src/racing_line_pinn/compare.py
++++ /dev/null
+@@ -1,30 +0,0 @@
+-"""Evaluation utilities for comparing predicted and actual racing-line performance."""
+-
+-from __future__ import annotations
+-
+-import math
+-
+-import numpy as np
+-
+-
+-def calculate_speed_metrics(actual_speed: list[float] | np.ndarray, predicted_speed: list[float] | np.ndarray) -> dict[str, float]:
+-    """Compute summary metrics for comparing actual and predicted speed traces."""
+-    actual = np.asarray(actual_speed, dtype=float)
+-    predicted = np.asarray(predicted_speed, dtype=float)
+-    errors = predicted - actual
+-    rmse = math.sqrt(float(np.mean(errors ** 2)))
+-    mae = float(np.mean(np.abs(errors)))
+-    mean_error = float(np.mean(errors))
+-    return {
+-        "rmse": rmse,
+-        "mae": mae,
+-        "mean_error": mean_error,
+-    }
+-
+-
+-def synthesize_driver_trajectory(n_points: int = 32):
+-    """Create a synthetic driver trajectory around a corner with apex-like behavior."""
+-    t = np.linspace(0.0, 1.0, n_points)
+-    x = np.linspace(-1.0, 1.0, n_points)
+-    y = 0.35 * np.sin(np.pi * t) - 0.1 * np.cos(2.0 * np.pi * t)
+-    return {"x": x, "y": y}
+diff --git a/src/racing_line_pinn/dataset.py b/src/racing_line_pinn/dataset.py
+index 53db876..c1de11d 100644
+--- a/src/racing_line_pinn/dataset.py
++++ b/src/racing_line_pinn/dataset.py
+@@ -1,74 +1,97 @@
+-"""Synthetic and real-telemetry dataset utilities for racing-line modeling."""
++"""Physics-coupled training-sample generation for the racing-line model.
++
++Replaces per-driver data mixing with a single physically self-consistent
++speed profile: a forward/backward minimum-lap-time solve (corner grip cap,
++traction-limited acceleration, max-braking deceleration) computed purely from
++track curvature and the Phase-2 calibrated :class:`VehicleParams` -- the
++fastest profile achievable by ONE physically-consistent car, not a
++cross-driver composite.
++"""
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++import math
+ 
+ import numpy as np
+ import torch
+ 
+-from .physics import compute_racing_line_target_speed
+-
+-
+-@dataclass
+-class TrackSample:
+-    curvature: float
+-    radius: float
+-    mu: float
+-    downforce: float
+-    mass: float
+-    target_speed: float
+-
+-
+-def generate_synthetic_track_samples(
+-    n_samples: int = 2048,
+-    mu_min: float = 1.2,
+-    mu_max: float = 1.6,
+-    downforce_min: float = 1800.0,
+-    downforce_max: float = 4500.0,
+-    mass_min: float = 700.0,
+-    mass_max: float = 850.0,
+-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+-    """Generate a synthetic dataset of corner curvatures and physics conditions."""
+-    rng = np.random.default_rng(42)
+-    curvature = rng.uniform(0.02, 0.18, size=n_samples).astype(np.float32)
+-    radius = 1.0 / curvature
+-    mu = rng.uniform(mu_min, mu_max, size=n_samples).astype(np.float32)
+-    downforce = rng.uniform(downforce_min, downforce_max, size=n_samples).astype(np.float32)
+-    mass = rng.uniform(mass_min, mass_max, size=n_samples).astype(np.float32)
+-
+-    target_speed = np.array(
+-        [
+-            compute_racing_line_target_speed(
+-                curvature=float(c),
+-                radius=float(r),
+-                mu=float(m),
+-                mass=float(mass_i),
+-                downforce=float(d),
+-            )
+-            for c, r, m, mass_i, d in zip(curvature, radius, mu, mass, downforce)
+-        ],
+-        dtype=np.float32,
+-    )
++from .calibration import VehicleParams
++from .physics import calculate_aero_drag, calculate_speed_dependent_normal_load
++
++GRAVITY = 9.81
++
++
++def _corner_cap_speed(curvature: np.ndarray, vehicle: VehicleParams, iterations: int = 30) -> np.ndarray:
++    """Self-consistent grip-limited speed at every point (no braking/throttle, long_accel=0).
++
++    Downforce grows with speed, so the grip limit itself depends on speed;
++    this iterates to a fixed point rather than solving in closed form.
++    """
++    radius = 1.0 / np.maximum(np.abs(curvature), 1e-6)
++    speed = np.sqrt(vehicle.mu * GRAVITY * radius)
++    for _ in range(iterations):
++        normal_force = calculate_speed_dependent_normal_load(vehicle.mass, speed, 1.0, vehicle.aero_lift_area)
++        lateral_limit = vehicle.mu * normal_force / vehicle.mass
++        speed = np.sqrt(np.maximum(lateral_limit * radius, 0.0))
++    return speed
+ 
+-    features = np.stack([curvature, radius, mu, downforce], axis=1).astype(np.float32)
+-    return (
+-        torch.tensor(features),
+-        torch.tensor(curvature),
+-        torch.tensor(mu),
+-        torch.tensor(downforce),
+-        torch.tensor(mass),
+-        torch.tensor(target_speed),
+-    )
+ 
++def _forward_pass(
++    s: np.ndarray, corner_cap: np.ndarray, vehicle: VehicleParams, start_speed: float | None = None
++) -> np.ndarray:
++    """Propagate speed forward, limited by traction-limited accel minus aero drag."""
++    ds = np.diff(s)
++    speed = np.empty_like(corner_cap)
++    speed[0] = min(start_speed, corner_cap[0]) if start_speed is not None else corner_cap[0]
++    for i in range(1, speed.size):
++        v_prev = float(speed[i - 1])
++        drag_decel = float(calculate_aero_drag(v_prev, 1.0, vehicle.aero_drag_area)) / vehicle.mass
++        net_accel = max(vehicle.max_accel - drag_decel, 0.0)
++        v_candidate = math.sqrt(v_prev ** 2 + 2.0 * net_accel * ds[i - 1])
++        speed[i] = min(v_candidate, corner_cap[i])
++    return speed
+ 
+-def load_fastf1_telemetry(path: str | None = None):
+-    """Optional hook for real FastF1 telemetry ingestion.
+ 
+-    If FastF1 is not installed or a path is not provided, this returns a synthetic
+-    placeholder dataset so the project can still execute in offline environments.
++def _backward_pass(
++    s: np.ndarray, corner_cap: np.ndarray, max_decel: float, start_speed: float | None = None
++) -> np.ndarray:
++    """Propagate speed backward from each point, limited by max braking deceleration."""
++    ds = np.diff(s)
++    speed = np.empty_like(corner_cap)
++    speed[-1] = min(start_speed, corner_cap[-1]) if start_speed is not None else corner_cap[-1]
++    for i in range(speed.size - 2, -1, -1):
++        v_next = float(speed[i + 1])
++        v_candidate = math.sqrt(v_next ** 2 + 2.0 * max_decel * ds[i])
++        speed[i] = min(v_candidate, corner_cap[i])
++    return speed
++
++
++def build_training_samples(
++    s: np.ndarray, curvature: np.ndarray, vehicle: VehicleParams
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Build the physics-coupled target speed profile for one session's curvature(s).
++
++    Runs the corner-cap -> forward-accel -> backward-brake solve, then takes
++    the minimum at each point -- the fastest profile achievable by one
++    physically-consistent car. Each pass runs twice (second pass seeded from
++    the first pass's far end) to approximate the closed-loop steady state of
++    a repeating lap, since the track is a circuit, not an isolated segment.
++
++    Returns ``(curvature, target_speed, corner_cap)`` tensors, all aligned to
++    ``s``'s order and length.
+     """
+-    if path is not None:
+-        return path
++    corner_cap = _corner_cap_speed(curvature, vehicle)
++
++    v_fwd = _forward_pass(s, corner_cap, vehicle)
++    v_fwd = _forward_pass(s, corner_cap, vehicle, start_speed=float(v_fwd[-1]))
+ 
+-    return generate_synthetic_track_samples()
++    v_bwd = _backward_pass(s, corner_cap, vehicle.max_decel)
++    v_bwd = _backward_pass(s, corner_cap, vehicle.max_decel, start_speed=float(v_bwd[0]))
++
++    target_speed = np.minimum(np.minimum(corner_cap, v_fwd), v_bwd)
++
++    return (
++        torch.tensor(curvature, dtype=torch.float32),
++        torch.tensor(target_speed, dtype=torch.float32),
++        torch.tensor(corner_cap, dtype=torch.float32),
++    )
+diff --git a/src/racing_line_pinn/evaluation.py b/src/racing_line_pinn/evaluation.py
+new file mode 100644
+index 0000000..a7f6145
+--- /dev/null
++++ b/src/racing_line_pinn/evaluation.py
+@@ -0,0 +1,112 @@
++"""Consolidated evaluation utilities: per-driver vs. model speed comparison.
++
++Merges the old ``compare.py`` / ``session_analysis.py`` / ``reporting.py`` metric
++logic into one module. Unlike the old dict-based session format (which had to
++estimate its own curvature/arc-length from raw x/y), every driver and the
++model now already share one common centerline arc-length ``s`` grid (see
++``real_data.py``), so comparison here is a direct point-by-point operation.
++"""
++
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++
++import numpy as np
++
++from .real_data import DriverLapData
++
++
++def calculate_speed_metrics(
++    actual_speed: list[float] | np.ndarray, predicted_speed: list[float] | np.ndarray
++) -> dict[str, float]:
++    """Compute summary metrics for comparing actual and predicted speed traces."""
++    actual = np.asarray(actual_speed, dtype=float)
++    predicted = np.asarray(predicted_speed, dtype=float)
++    errors = predicted - actual
++    return {
++        "rmse": math.sqrt(float(np.mean(errors ** 2))),
++        "mae": float(np.mean(np.abs(errors))),
++        "mean_error": float(np.mean(errors)),
++    }
++
++
++def compute_delta_traces(
++    s: np.ndarray, actual_speed: np.ndarray, predicted_speed: np.ndarray
++) -> dict[str, np.ndarray]:
++    """Compute distance-aligned speed delta and cumulative time-loss curves.
++
++    Delta v(s) = predicted_speed - actual_speed (positive means the model
++    expects more speed than the driver actually carried). Delta t(s) is the
++    cumulative integral of (ds / actual_speed - ds / predicted_speed): a
++    running total, in seconds, of time the actual driver lost (positive) or
++    gained (negative) relative to the model at each point along the lap.
++    """
++    s_arr = np.asarray(s, dtype=float)
++    actual = np.clip(np.asarray(actual_speed, dtype=float), 1e-3, None)
++    predicted = np.clip(np.asarray(predicted_speed, dtype=float), 1e-3, None)
++    ds = np.diff(s_arr, prepend=s_arr[0])
++    delta_t = np.cumsum(ds / actual - ds / predicted)
++    return {"delta_v": predicted - actual, "delta_t": delta_t}
++
++
++@dataclass
++class DriverComparison:
++    """Per-driver comparison result against the shared model speed curve."""
++
++    driver: str
++    s: np.ndarray
++    delta_v: np.ndarray
++    delta_t: np.ndarray
++    rmse: float
++    mae: float
++    mean_error: float
++    total_delta_t: float
++
++
++def compare_driver_to_model(
++    driver: str,
++    driver_s: np.ndarray,
++    driver_speed: np.ndarray,
++    model_s: np.ndarray,
++    model_speed: np.ndarray,
++) -> DriverComparison:
++    """Compare one driver's real speed trace to the model's predicted speed.
++
++    Both sides are expected to already share the common centerline ``s`` grid
++    (see ``real_data.py``); the model trace is re-interpolated onto
++    ``driver_s`` only if the grids differ (defensive, not expected in normal
++    use since every driver is resampled onto the same centerline).
++    """
++    driver_s_arr = np.asarray(driver_s, dtype=float)
++    driver_speed_arr = np.asarray(driver_speed, dtype=float)
++    model_s_arr = np.asarray(model_s, dtype=float)
++    model_speed_arr = np.asarray(model_speed, dtype=float)
++
++    if model_s_arr.shape != driver_s_arr.shape or not np.allclose(model_s_arr, driver_s_arr):
++        model_speed_arr = np.interp(driver_s_arr, model_s_arr, model_speed_arr)
++
++    metrics = calculate_speed_metrics(driver_speed_arr, model_speed_arr)
++    deltas = compute_delta_traces(driver_s_arr, driver_speed_arr, model_speed_arr)
++
++    return DriverComparison(
++        driver=driver,
++        s=driver_s_arr,
++        delta_v=deltas["delta_v"],
++        delta_t=deltas["delta_t"],
++        rmse=metrics["rmse"],
++        mae=metrics["mae"],
++        mean_error=metrics["mean_error"],
++        total_delta_t=float(deltas["delta_t"][-1]) if deltas["delta_t"].size else 0.0,
++    )
++
++
++def build_leaderboard(
++    drivers: dict[str, DriverLapData], model_s: np.ndarray, model_speed: np.ndarray
++) -> list[DriverComparison]:
++    """Compare every driver against the model, sorted fastest-vs-model first."""
++    comparisons = [
++        compare_driver_to_model(code, lap.s, lap.speed, model_s, model_speed) for code, lap in drivers.items()
++    ]
++    comparisons.sort(key=lambda comparison: comparison.total_delta_t)
++    return comparisons
+diff --git a/src/racing_line_pinn/frenet.py b/src/racing_line_pinn/frenet.py
+new file mode 100644
+index 0000000..a7e784e
+--- /dev/null
++++ b/src/racing_line_pinn/frenet.py
+@@ -0,0 +1,201 @@
++"""Frenet-Serret track coordinate utilities.
++
++Converts cartesian (X, Y) telemetry into track-relative (s, d) coordinates,
++where s is arc length along a centerline and d is the signed lateral offset
++from it. Also provides track-width estimation so that |d(s)| <= W(s)/2.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++from scipy.signal import savgol_filter
++
++
++def compute_track_reference(
++    x: list[float] | np.ndarray,
++    y: list[float] | np.ndarray,
++) -> tuple[float, float, float]:
++    """Compute a PCA-derived ``(mean_x, mean_y, angle)`` frame, in raw input units.
++
++    Pass the result as ``reference`` to :func:`normalize_and_rotate` for every
++    lap in a session so all laps share the exact same coordinate frame as the
++    one used to derive this reference (typically the centerline lap), instead
++    of each lap recomputing its own slightly different PCA rotation.
++    """
++    x_arr = np.asarray(x, dtype=float)
++    y_arr = np.asarray(y, dtype=float)
++    if x_arr.size < 2:
++        return 0.0, 0.0, 0.0
++
++    mean_x, mean_y = float(x_arr.mean()), float(y_arr.mean())
++    x_centered = x_arr - mean_x
++    y_centered = y_arr - mean_y
++
++    cov = np.cov(np.vstack([x_centered, y_centered]))
++    eigvals, eigvecs = np.linalg.eigh(cov)
++    principal = eigvecs[:, int(np.argmax(eigvals))]
++    angle = float(np.arctan2(principal[1], principal[0]))
++    return mean_x, mean_y, angle
++
++
++def normalize_and_rotate(
++    x: list[float] | np.ndarray,
++    y: list[float] | np.ndarray,
++    unit_scale: float = 0.1,
++    reference: tuple[float, float, float] | None = None,
++) -> tuple[np.ndarray, np.ndarray]:
++    """Center, rescale, and PCA-rotate track coordinates.
++
++    FastF1 telemetry X/Y is reported in decimeters; ``unit_scale=0.1`` converts
++    it to meters. The rotation aligns the dominant (straight-line) axis of the
++    track with the x-axis so straights render horizontally regardless of the
++    original telemetry orientation.
++
++    ``reference``, when given, is a ``(mean_x, mean_y, angle)`` tuple from
++    :func:`compute_track_reference` (raw input units) that is applied instead
++    of recomputing PCA from ``x``/``y`` themselves -- use this to align
++    multiple drivers' laps to one shared frame (the centerline's).
++    """
++    x_arr = np.asarray(x, dtype=float)
++    y_arr = np.asarray(y, dtype=float)
++
++    if x_arr.size < 2:
++        return x_arr * unit_scale, y_arr * unit_scale
++
++    if reference is None:
++        mean_x, mean_y, angle = compute_track_reference(x_arr, y_arr)
++    else:
++        mean_x, mean_y, angle = reference
++
++    x_centered = (x_arr - mean_x) * unit_scale
++    y_centered = (y_arr - mean_y) * unit_scale
++
++    cos_a, sin_a = np.cos(-angle), np.sin(-angle)
++    x_rot = cos_a * x_centered - sin_a * y_centered
++    y_rot = sin_a * x_centered + cos_a * y_centered
++    return x_rot, y_rot
++
++
++def smooth_path(
++    x: list[float] | np.ndarray,
++    y: list[float] | np.ndarray,
++    window_length: int = 15,
++    polyorder: int = 3,
++) -> tuple[np.ndarray, np.ndarray]:
++    """Lightly smooth a path's x/y before curvature estimation.
++
++    Reduces telemetry-noise amplification in downstream curvature/derivative
++    calculations. Falls back to the unsmoothed input when there are too few
++    points for the requested window.
++    """
++    x_arr = np.asarray(x, dtype=float)
++    y_arr = np.asarray(y, dtype=float)
++
++    window = min(window_length, x_arr.size)
++    if window % 2 == 0:
++        window -= 1
++    if window <= polyorder or window < 5:
++        return x_arr, y_arr
++
++    x_smooth = savgol_filter(x_arr, window_length=window, polyorder=polyorder)
++    y_smooth = savgol_filter(y_arr, window_length=window, polyorder=polyorder)
++    return x_smooth, y_smooth
++
++
++def compute_curvature(
++    x: list[float] | np.ndarray,
++    y: list[float] | np.ndarray,
++) -> np.ndarray:
++    """Estimate signed curvature kappa(s) = (x'y'' - y'x'') / (x'^2 + y'^2)^1.5.
++
++    Expects an already-smoothed path (see :func:`smooth_path`); the analytic
++    derivative formula is still noise-sensitive, so smoothing beforehand is
++    what keeps this numerically well-behaved.
++    """
++    x_arr = np.asarray(x, dtype=float)
++    y_arr = np.asarray(y, dtype=float)
++    if x_arr.size < 3:
++        return np.zeros_like(x_arr)
++
++    dx = np.gradient(x_arr)
++    dy = np.gradient(y_arr)
++    ddx = np.gradient(dx)
++    ddy = np.gradient(dy)
++
++    denom = np.power(dx ** 2 + dy ** 2, 1.5)
++    denom = np.where(denom < 1e-9, 1e-9, denom)
++    return (dx * ddy - dy * ddx) / denom
++
++
++def cartesian_to_frenet(
++    x: list[float] | np.ndarray,
++    y: list[float] | np.ndarray,
++    path_x: list[float] | np.ndarray | None = None,
++    path_y: list[float] | np.ndarray | None = None,
++) -> tuple[np.ndarray, np.ndarray]:
++    """Convert cartesian points to Frenet (s, d) coordinates along a centerline.
++
++    When ``path_x``/``path_y`` are omitted, ``(x, y)`` is treated as its own
++    centerline: s is the cumulative arc length and d is zero everywhere.
++    Otherwise, each point is projected onto the nearest segment of the
++    centerline to recover arc-length ``s`` and signed lateral offset ``d``
++    (positive to the left of the direction of travel).
++    """
++    x_arr = np.asarray(x, dtype=float)
++    y_arr = np.asarray(y, dtype=float)
++
++    if path_x is None or path_y is None:
++        if x_arr.size < 2:
++            return np.zeros_like(x_arr), np.zeros_like(x_arr)
++        seg_len = np.hypot(np.diff(x_arr), np.diff(y_arr))
++        s = np.concatenate([[0.0], np.cumsum(seg_len)])
++        return s, np.zeros_like(s)
++
++    path_x_arr = np.asarray(path_x, dtype=float)
++    path_y_arr = np.asarray(path_y, dtype=float)
++    if path_x_arr.size < 2:
++        return np.zeros_like(x_arr), np.zeros_like(x_arr)
++
++    seg_dx = np.diff(path_x_arr)
++    seg_dy = np.diff(path_y_arr)
++    seg_len = np.hypot(seg_dx, seg_dy)
++    seg_len_sq = np.maximum(seg_dx ** 2 + seg_dy ** 2, 1e-12)
++    cum_len = np.concatenate([[0.0], np.cumsum(seg_len)])
++
++    ax = path_x_arr[:-1]
++    ay = path_y_arr[:-1]
++
++    s = np.zeros(x_arr.shape[0])
++    d = np.zeros(x_arr.shape[0])
++
++    for i in range(x_arr.shape[0]):
++        px, py = x_arr[i], y_arr[i]
++        t = np.clip(((px - ax) * seg_dx + (py - ay) * seg_dy) / seg_len_sq, 0.0, 1.0)
++        proj_x = ax + t * seg_dx
++        proj_y = ay + t * seg_dy
++        dist = np.hypot(px - proj_x, py - proj_y)
++        j = int(np.argmin(dist))
++        cross = seg_dx[j] * (py - ay[j]) - seg_dy[j] * (px - ax[j])
++        s[i] = cum_len[j] + t[j] * seg_len[j]
++        d[i] = np.sign(cross) * dist[j] if seg_len[j] > 1e-9 else 0.0
++
++    return s, d
++
++
++def estimate_track_width(
++    d: list[float] | np.ndarray,
++    default_width: float = 12.0,
++    margin: float = 1.2,
++) -> np.ndarray:
++    """Estimate a track width envelope W(s) that bounds observed lateral offsets.
++
++    Returns a per-sample width array sized so that ``|d(s)| <= W(s)/2`` holds
++    for the supplied offsets, with a safety margin and a sensible minimum.
++    """
++    d_arr = np.asarray(d, dtype=float)
++    if d_arr.size == 0:
++        return np.array([], dtype=float)
++
++    observed_half_width = float(np.max(np.abs(d_arr))) * margin
++    half_width = max(observed_half_width, default_width / 2.0)
++    return np.full(d_arr.shape, 2.0 * half_width)
+diff --git a/src/racing_line_pinn/live_demo.py b/src/racing_line_pinn/live_demo.py
+deleted file mode 100644
+index 6a5fd0f..0000000
+--- a/src/racing_line_pinn/live_demo.py
++++ /dev/null
+@@ -1,124 +0,0 @@
+-"""Utilities for the interactive racing-line demo."""
+-
+-from __future__ import annotations
+-
+-import numpy as np
+-
+-from .physics import compute_racing_line_target_speed
+-
+-
+-TRACK_LIBRARY = {
+-    "Spa-Francorchamps": {
+-        "x_scale": 1.5,
+-        "y_scale": 1.0,
+-        "turn_bias": 1.0,
+-    },
+-    "Silverstone": {
+-        "x_scale": 1.4,
+-        "y_scale": 0.9,
+-        "turn_bias": 0.75,
+-    },
+-    "Monza": {
+-        "x_scale": 1.7,
+-        "y_scale": 0.7,
+-        "turn_bias": 0.55,
+-    },
+-    "Suzuka": {
+-        "x_scale": 1.45,
+-        "y_scale": 0.95,
+-        "turn_bias": 0.9,
+-    },
+-}
+-
+-CAR_PRESETS = {
+-    "Ferrari SF-24": {"mu": 1.35, "downforce": 3200.0, "mass": 800.0},
+-    "Red Bull RB20": {"mu": 1.42, "downforce": 3600.0, "mass": 790.0},
+-    "Mercedes W15": {"mu": 1.38, "downforce": 3400.0, "mass": 810.0},
+-    "McLaren MCL60": {"mu": 1.33, "downforce": 3000.0, "mass": 820.0},
+-    "Custom": {"mu": 1.35, "downforce": 3000.0, "mass": 800.0},
+-}
+-
+-
+-def _track_parametric_profile(track_name: str, n_points: int = 400, amplitude: float = 1.0):
+-    """Create a synthetic but circuit-like centerline for a selected track."""
+-    t = np.linspace(0.0, 1.0, n_points)
+-    profile = TRACK_LIBRARY.get(track_name, TRACK_LIBRARY["Spa-Francorchamps"])
+-    x_scale = profile["x_scale"]
+-    y_scale = profile["y_scale"]
+-    turn_bias = profile["turn_bias"]
+-
+-    if track_name == "Spa-Francorchamps":
+-        x = x_scale * (np.cos(2.0 * np.pi * t) + 0.24 * np.sin(6.0 * np.pi * t))
+-        y = y_scale * (np.sin(2.0 * np.pi * t) + 0.18 * np.cos(4.0 * np.pi * t))
+-    elif track_name == "Silverstone":
+-        x = x_scale * np.cos(2.0 * np.pi * t)
+-        y = y_scale * (np.sin(2.0 * np.pi * t) + 0.12 * np.sin(4.0 * np.pi * t))
+-    elif track_name == "Monza":
+-        x = x_scale * np.cos(2.0 * np.pi * t) + 0.35 * np.sin(2.0 * np.pi * t)
+-        y = y_scale * np.sin(2.0 * np.pi * t)
+-    else:
+-        x = x_scale * (np.cos(2.0 * np.pi * t) + 0.2 * np.sin(4.0 * np.pi * t))
+-        y = y_scale * (np.sin(2.0 * np.pi * t) + 0.15 * np.sin(6.0 * np.pi * t))
+-
+-    x *= amplitude
+-    y *= amplitude * (0.75 + turn_bias * 0.55)
+-    return x, y
+-
+-
+-def _estimate_curvature(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+-    """Estimate the local geometric curvature from x/y coordinates."""
+-    dx = np.diff(x)
+-    dy = np.diff(y)
+-    theta = np.arctan2(dy, dx)
+-    dtheta = np.diff(np.unwrap(theta))
+-    ds = np.hypot(dx[:-1], dy[:-1])
+-    curvature = np.abs(dtheta) / np.maximum(ds, 1e-6)
+-    curvature = np.pad(curvature, (1, 1), mode="edge")
+-    return curvature
+-
+-
+-def simulate_session(
+-    track_name: str = "Spa-Francorchamps",
+-    mu: float = 1.35,
+-    downforce: float = 3000.0,
+-    mass: float = 800.0,
+-    amplitude: float = 1.0,
+-):
+-    """Create actual and ideal lap traces under a selected circuit and setup."""
+-    x, y = _track_parametric_profile(track_name, n_points=420, amplitude=amplitude)
+-    curvature = _estimate_curvature(x, y)
+-
+-    ideal_x = x.copy()
+-    ideal_y = y.copy()
+-    actual_x = x + 0.08 * np.sin(2.0 * np.pi * np.linspace(0.0, 1.0, len(x)))
+-    actual_y = y + 0.06 * np.cos(2.0 * np.pi * np.linspace(0.0, 1.0, len(y)))
+-
+-    predicted_speed = []
+-    for c in curvature:
+-        radius = 1.0 / max(abs(float(c)), 1e-3)
+-        predicted_speed.append(
+-            compute_racing_line_target_speed(
+-                curvature=float(c),
+-                radius=float(radius),
+-                mu=float(mu),
+-                mass=float(mass),
+-                downforce=float(downforce),
+-            )
+-        )
+-
+-    actual_speed = np.asarray(predicted_speed, dtype=float) * (0.82 + 0.22 * np.sin(np.linspace(0.0, 2.0 * np.pi, len(predicted_speed))))
+-    apex_index = int(np.argmax(np.abs(curvature)))
+-
+-    return {
+-        "track_name": track_name,
+-        "x": ideal_x,
+-        "y": ideal_y,
+-        "actual_x": actual_x,
+-        "actual_y": actual_y,
+-        "predicted_speed": np.asarray(predicted_speed, dtype=float),
+-        "actual_speed": actual_speed,
+-        "curvature": curvature,
+-        "apex_index": apex_index,
+-        "apex_x": ideal_x[apex_index],
+-        "apex_y": ideal_y[apex_index],
+-    }
+diff --git a/src/racing_line_pinn/model.py b/src/racing_line_pinn/model.py
+index 11b2f47..2c72503 100644
+--- a/src/racing_line_pinn/model.py
++++ b/src/racing_line_pinn/model.py
+@@ -2,16 +2,22 @@
+ 
+ from __future__ import annotations
+ 
+-import math
+-
+ import torch
+ from torch import nn
+ 
++from .calibration import VehicleParams
++from .physics import AIR_DENSITY_SEA_LEVEL
++
+ 
+ class RacingLinePINN(nn.Module):
+-    """A compact MLP that predicts speed from track curvature and setup inputs."""
++    """A compact MLP predicting the shared "ideal line" speed from curvature alone.
+ 
+-    def __init__(self, input_dim: int = 3, hidden_dim: int = 32):
++    Vehicle parameters (mu, mass, aero) are calibrated constants (see
++    :mod:`racing_line_pinn.calibration`), not model inputs -- there is one
++    shared ideal-line model per session, not a model per vehicle setup.
++    """
++
++    def __init__(self, input_dim: int = 1, hidden_dim: int = 32):
+         super().__init__()
+         self.net = nn.Sequential(
+             nn.Linear(input_dim, hidden_dim),
+@@ -25,21 +31,34 @@ class RacingLinePINN(nn.Module):
+         return self.net(x).squeeze(-1)
+ 
+ 
+-def physics_loss(predicted_speed: torch.Tensor, curvature: torch.Tensor, mu: torch.Tensor, downforce: torch.Tensor, mass: torch.Tensor, target_speed: torch.Tensor) -> torch.Tensor:
+-    """Physics-informed loss that penalizes grip violations and pushes exit speed higher."""
++def physics_loss(
++    predicted_speed: torch.Tensor,
++    curvature: torch.Tensor,
++    target_speed: torch.Tensor,
++    vehicle: VehicleParams,
++    grip_weight: float = 5.0,
++    lap_time_weight: float = 0.05,
++) -> torch.Tensor:
++    """Multi-term physics-informed loss: data fit + friction-limit penalty + lap time.
++
++    - Data term: MSE between predicted and target speed.
++    - Friction penalty: ``relu(predicted_speed - safe_speed) ** 2``, where
++      ``safe_speed`` is the max cornering speed the calibrated tyres/aero can
++      sustain at the predicted speed (speed-dependent downforce), a discrete
++      analogue of the Pacejka combined friction ellipse limit.
++    - Lap-time term: ``mean(1 / predicted_speed)``, a discrete proxy for the
++      lap-time integral ``integral(1/v ds)`` over the batch of track samples,
++      rewarding the model for finding higher (but still grip-legal) speeds.
++    """
+     eps = 1e-8
+-    lateral_limit = mu * (mass * 9.81 + downforce) / mass
+-    safe_speed = torch.sqrt(torch.clamp(lateral_limit * (1.0 / torch.clamp(torch.abs(curvature), min=eps)), min=eps))
++    effective_downforce = 0.5 * AIR_DENSITY_SEA_LEVEL * vehicle.aero_lift_area * predicted_speed.detach() ** 2
++    normal_force = vehicle.mass * 9.81 + effective_downforce
++    lateral_limit = vehicle.mu * normal_force / vehicle.mass
++    safe_speed = torch.sqrt(torch.clamp(lateral_limit / torch.clamp(torch.abs(curvature), min=eps), min=eps))
+     grip_penalty = torch.relu(predicted_speed - safe_speed)
+-    exit_speed_bonus = -0.01 * predicted_speed
+-    return torch.mean((predicted_speed - target_speed) ** 2 + 5.0 * grip_penalty ** 2 + 0.5 * exit_speed_bonus)
+-
+-
+-def synthetic_track_points(n: int = 200) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-    """Produce synthetic curvature and setup samples for model demos."""
+-    t = torch.linspace(0.0, 1.0, n)
+-    curvature = 0.02 + 0.12 * torch.sin(2.0 * math.pi * t)
+-    mu = torch.full_like(t, 1.25)
+-    downforce = 2000.0 + 2500.0 * t
+-    mass = torch.full_like(t, 750.0)
+-    return curvature, mu, downforce, mass
++
++    data_term = (predicted_speed - target_speed) ** 2
++    lap_time_term = 1.0 / torch.clamp(predicted_speed, min=1.0)
++
++    return torch.mean(data_term + grip_weight * grip_penalty ** 2 + lap_time_weight * lap_time_term)
++
+diff --git a/src/racing_line_pinn/physics.py b/src/racing_line_pinn/physics.py
+index 03cb94e..9ee41d2 100644
+--- a/src/racing_line_pinn/physics.py
++++ b/src/racing_line_pinn/physics.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+ 
+ import math
+ 
++AIR_DENSITY_SEA_LEVEL = 1.225  # kg/m^3
++
+ 
+ def calculate_lateral_grip_limit(mu: float, mass: float, downforce: float) -> float:
+     """Return the maximum lateral acceleration available in m/s^2.
+@@ -49,3 +51,124 @@ def compute_racing_line_target_speed(
+     corner_limit = compute_corner_speed_limit(radius, mu, downforce, mass)
+     curvature_factor = 1.0 / max(abs(curvature), 1e-6)
+     return max(min(corner_limit, curvature_factor * 35.0), 0.0)
++
++
++def calculate_aero_downforce(speed: float, c_lift: float, frontal_area: float, air_density: float = AIR_DENSITY_SEA_LEVEL) -> float:
++    """Speed-dependent aerodynamic downforce: F_z = 1/2 * rho * C_L * A * v^2."""
++    if frontal_area <= 0:
++        raise ValueError("frontal_area must be positive.")
++    return 0.5 * air_density * c_lift * frontal_area * speed ** 2
++
++
++def calculate_aero_drag(speed: float, c_drag: float, frontal_area: float, air_density: float = AIR_DENSITY_SEA_LEVEL) -> float:
++    """Speed-dependent aerodynamic drag: F_d = 1/2 * rho * C_D * A * v^2."""
++    if frontal_area <= 0:
++        raise ValueError("frontal_area must be positive.")
++    return 0.5 * air_density * c_drag * frontal_area * speed ** 2
++
++
++def calculate_speed_dependent_normal_load(
++    mass: float,
++    speed: float,
++    c_lift: float,
++    frontal_area: float,
++    air_density: float = AIR_DENSITY_SEA_LEVEL,
++) -> float:
++    """Total normal load F_z = mg + aero downforce, which grows with v^2."""
++    if mass <= 0:
++        raise ValueError("mass must be positive.")
++    return mass * 9.81 + calculate_aero_downforce(speed, c_lift, frontal_area, air_density)
++
++
++def pacejka_combined_friction_limit(mu: float, normal_force: float, mass: float, long_accel: float = 0.0) -> float:
++    """Max lateral acceleration under a Pacejka-style combined friction ellipse.
++
++    Uses the elliptical friction-circle constraint
++    ``(a_lat / a_max)^2 + (a_long / a_max)^2 <= 1``, so braking or accelerating
++    (``long_accel``) reduces the lateral grip budget left over for cornering.
++    """
++    if mu <= 0 or mass <= 0:
++        raise ValueError("mu and mass must be positive.")
++
++    a_max = mu * normal_force / mass
++    if a_max <= 0:
++        return 0.0
++    remaining = max(1.0 - (long_accel / a_max) ** 2, 0.0)
++    return a_max * math.sqrt(remaining)
++
++
++def compute_two_track_weight_transfer(mass: float, lateral_accel: float, cg_height: float, track_width: float) -> float:
++    """Simplified two-track lateral weight transfer: delta F_z = m * a_lat * h / t."""
++    if track_width <= 0:
++        raise ValueError("track_width must be positive.")
++    return mass * lateral_accel * cg_height / track_width
++
++
++def distribute_wheel_loads(normal_force: float, weight_transfer: float) -> dict[str, float]:
++    """Split total normal load into four corner loads under lateral weight transfer.
++
++    Assumes an even static front/rear split and an even front/rear share of the
++    lateral transfer (a simplified two-track model, not a full suspension model).
++    """
++    per_wheel_static = normal_force / 4.0
++    per_axle_transfer = weight_transfer / 2.0
++    outer = per_wheel_static + per_axle_transfer / 2.0
++    inner = per_wheel_static - per_axle_transfer / 2.0
++    return {
++        "front_outer": outer,
++        "front_inner": inner,
++        "rear_outer": outer,
++        "rear_inner": inner,
++    }
++
++
++def compute_target_speed_with_aero(
++    curvature: float,
++    radius: float,
++    mu: float,
++    mass: float,
++    c_lift: float,
++    c_drag: float = 0.9,
++    frontal_area: float = 1.5,
++    air_density: float = AIR_DENSITY_SEA_LEVEL,
++    cg_height: float = 0.3,
++    track_width: float = 1.6,
++    iterations: int = 4,
++) -> dict:
++    """Estimate cornering target speed including speed-dependent aero downforce.
++
++    Since downforce (and therefore available grip) grows with v^2, this solves
++    for a self-consistent speed by iterating: recompute normal load, the
++    Pacejka combined-ellipse lateral limit, and weight transfer at the previous
++    speed estimate until the value converges. Returns the resulting speed
++    alongside the supporting load/grip breakdown.
++    """
++    if radius <= 0:
++        raise ValueError("radius must be positive.")
++    if mass <= 0:
++        raise ValueError("mass must be positive.")
++
++    curvature_cap = 1.0 / max(abs(curvature), 1e-6) * 35.0
++    speed = math.sqrt(max(mu * 9.81 * radius, 0.0))
++    normal_force = mass * 9.81
++    lateral_accel = 0.0
++
++    for _ in range(max(iterations, 1)):
++        normal_force = calculate_speed_dependent_normal_load(mass, speed, c_lift, frontal_area, air_density)
++        lateral_limit = pacejka_combined_friction_limit(mu, normal_force, mass, long_accel=0.0)
++        candidate = math.sqrt(max(lateral_limit * radius, 0.0))
++        speed = max(min(candidate, curvature_cap), 0.0)
++        lateral_accel = speed ** 2 / radius
++
++    weight_transfer = compute_two_track_weight_transfer(mass, lateral_accel, cg_height, track_width)
++    wheel_loads = distribute_wheel_loads(normal_force, weight_transfer)
++    drag_force = calculate_aero_drag(speed, c_drag, frontal_area, air_density)
++
++    return {
++        "speed": speed,
++        "normal_force": normal_force,
++        "lateral_accel": lateral_accel,
++        "weight_transfer": weight_transfer,
++        "wheel_loads": wheel_loads,
++        "drag_force": drag_force,
++    }
+diff --git a/src/racing_line_pinn/real_data.py b/src/racing_line_pinn/real_data.py
+index b6367a7..7da39c4 100644
+--- a/src/racing_line_pinn/real_data.py
++++ b/src/racing_line_pinn/real_data.py
+@@ -1,62 +1,218 @@
+-"""FastF1 integration scaffold for real telemetry ingestion.
++"""Real FastF1 telemetry ingestion for the 2023 Spa-Francorchamps Race.
+ 
+-This module intentionally validates the architecture: it provides a clean interface
+-for real-session retrieval, but gracefully degrades to synthetic data when FastF1
+-is unavailable or no session is specified.
++Loads every driver's fastest *clean* lap (accurate, green-flag only, DRS-closed
++samples only), builds one smoothed reference centerline from the fastest clean
++lap overall, and resamples every driver's speed/throttle/brake/position onto
++that centerline's shared arc-length ``s`` grid so all drivers -- and later the
++trained model -- can be compared point-by-point on one common axis.
+ """
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+ 
++import numpy as np
++
++from .frenet import (
++    cartesian_to_frenet,
++    compute_curvature,
++    compute_track_reference,
++    estimate_track_width,
++    normalize_and_rotate,
++    smooth_path,
++)
++
++CIRCUIT = "Spa-Francorchamps"
++DEFAULT_YEAR = 2023
++DEFAULT_SESSION = "R"
++DRS_OPEN_THRESHOLD = 10  # FastF1 DRS codes >=10 indicate the system is active/open
++CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", ".fastf1_cache")
++
+ 
+ @dataclass
+-class TelemetrySession:
+-    circuit: str
+-    year: int
++class DriverLapData:
++    """One driver's fastest clean lap, resampled onto the shared centerline ``s`` grid."""
++
+     driver: str
++    s: np.ndarray
++    speed: np.ndarray
++    x: np.ndarray
++    y: np.ndarray
++    throttle: np.ndarray
++    brake: np.ndarray
++    lap_time: float
++
++
++@dataclass
++class SpaSessionData:
++    """All drivers' aligned laps plus the shared centerline geometry for one session."""
++
++    year: int
+     session_name: str
+-    data: dict
++    centerline_x: np.ndarray
++    centerline_y: np.ndarray
++    s: np.ndarray
++    curvature: np.ndarray
++    track_width: np.ndarray
++    drivers: dict[str, DriverLapData]
++    reference_driver: str
++
++
++def _enable_cache() -> None:
++    try:
++        import fastf1  # type: ignore
++
++        os.makedirs(CACHE_DIR, exist_ok=True)
++        fastf1.Cache.enable_cache(CACHE_DIR)
++    except Exception:
++        pass
++
++
++def _is_clean_lap(lap) -> bool:
++    """Accurate green-flag lap only -- excludes SC/VSC/red/yellow and inaccurate laps."""
++    try:
++        is_accurate = bool(lap["IsAccurate"])
++        track_status = str(lap["TrackStatus"])
++        all_green = all(ch == "1" for ch in track_status) if track_status else True
++        return is_accurate and all_green
++    except Exception:
++        return False
++
++
++def _drs_closed_mask(telemetry) -> np.ndarray:
++    if "DRS" not in telemetry:
++        return np.ones(len(telemetry), dtype=bool)
++    drs = telemetry["DRS"].to_numpy(dtype=float)
++    return drs < DRS_OPEN_THRESHOLD
++
++
++def _resample_on_grid(s_target: np.ndarray, s_source: np.ndarray, values: np.ndarray) -> np.ndarray:
++    order = np.argsort(s_source)
++    s_sorted = s_source[order]
++    values_sorted = values[order]
++    unique_s, unique_idx = np.unique(s_sorted, return_index=True)
++    unique_values = values_sorted[unique_idx]
++    return np.interp(s_target, unique_s, unique_values, left=unique_values[0], right=unique_values[-1])
+ 
+ 
+-def load_fastf1_session(circuit: str = "Spa-Francorchamps", year: int = 2023, driver: str = "VER", session_name: str = "R"):
+-    """Attempt to load a real FastF1 session when the dependency is available.
++def load_spa_race_session(year: int = DEFAULT_YEAR, session_name: str = DEFAULT_SESSION) -> SpaSessionData | None:
++    """Load all drivers' fastest clean laps for the Spa race, aligned to one centerline.
+ 
+-    Returns a lightweight session object, but if FastF1 is missing or the query fails,
+-    it falls back to a synthetic placeholder. This keeps the project runnable offline.
++    Returns ``None`` if FastF1 is unavailable or the session can't be loaded
++    (e.g. no network access), so callers can fall back gracefully.
+     """
+     try:
+         import fastf1  # type: ignore
+     except Exception:
+-        return TelemetrySession(
+-            circuit=circuit,
+-            year=year,
+-            driver=driver,
+-            session_name=session_name,
+-            data={"x": [], "y": [], "speed": []},
+-        )
++        return None
++
++    _enable_cache()
+ 
+     try:
+-        session = fastf1.get_session(year, circuit, session_name)
++        session = fastf1.get_session(year, CIRCUIT, session_name)
+         session.load()
+-        laps = session.laps.pick_driver(driver)
+-        telemetry = laps.pick_fastest().get_car_data().dropna()
+-        return TelemetrySession(
+-            circuit=circuit,
+-            year=year,
+-            driver=driver,
+-            session_name=session_name,
+-            data={
+-                "x": telemetry.get("X", []),
+-                "y": telemetry.get("Y", []),
+-                "speed": telemetry.get("Speed", []),
+-            },
+-        )
++        laps = session.laps
++    except Exception:
++        return None
++
++    if laps is None or laps.empty:
++        return None
++
++    driver_codes = sorted(laps["Driver"].dropna().unique().tolist())
++    if not driver_codes:
++        return None
++
++    clean_mask = laps.apply(_is_clean_lap, axis=1)
++    clean_laps = laps[clean_mask]
++    if clean_laps.empty:
++        return None
++
++    try:
++        reference_lap = clean_laps.pick_fastest()
++        reference_telemetry = reference_lap.get_telemetry().dropna(subset=["X", "Y", "Speed"])
+     except Exception:
+-        return TelemetrySession(
+-            circuit=circuit,
+-            year=year,
+-            driver=driver,
+-            session_name=session_name,
+-            data={"x": [], "y": [], "speed": []},
++        return None
++
++    if reference_telemetry.empty:
++        return None
++
++    reference_driver = str(reference_lap["Driver"])
++    ref_x_raw = reference_telemetry["X"].to_numpy(dtype=float)
++    ref_y_raw = reference_telemetry["Y"].to_numpy(dtype=float)
++    reference_frame = compute_track_reference(ref_x_raw, ref_y_raw)
++
++    centerline_x, centerline_y = normalize_and_rotate(ref_x_raw, ref_y_raw, reference=reference_frame)
++    centerline_x, centerline_y = smooth_path(centerline_x, centerline_y)
++    s_center, d_center = cartesian_to_frenet(centerline_x, centerline_y)
++    curvature = compute_curvature(centerline_x, centerline_y)
++    track_width = estimate_track_width(d_center)
++
++    drivers: dict[str, DriverLapData] = {}
++    for code in driver_codes:
++        try:
++            driver_laps = clean_laps.pick_driver(code)
++            if driver_laps.empty:
++                continue
++            lap = driver_laps.pick_fastest()
++            if lap is None:
++                continue
++            telemetry = lap.get_telemetry().dropna(subset=["X", "Y", "Speed"])
++        except Exception:
++            continue
++
++        if telemetry.empty:
++            continue
++
++        keep = _drs_closed_mask(telemetry)
++        raw_x = telemetry["X"].to_numpy(dtype=float)[keep]
++        raw_y = telemetry["Y"].to_numpy(dtype=float)[keep]
++        speed_kmh = telemetry["Speed"].to_numpy(dtype=float)[keep]
++        if raw_x.size < 2:
++            continue
++
++        throttle = telemetry["Throttle"].to_numpy(dtype=float)[keep] if "Throttle" in telemetry else np.zeros(raw_x.size)
++        brake_raw = telemetry["Brake"].to_numpy(dtype=float)[keep] if "Brake" in telemetry else np.zeros(raw_x.size)
++        # FastF1's Brake channel is digital (0/1) for most seasons; normalize to a 0-100 scale.
++        brake = brake_raw * 100.0 if brake_raw.size and brake_raw.max() <= 1.0 else brake_raw
++
++        x_m, y_m = normalize_and_rotate(raw_x, raw_y, reference=reference_frame)
++        s_driver, _ = cartesian_to_frenet(x_m, y_m, path_x=centerline_x, path_y=centerline_y)
++
++        speed_on_grid = _resample_on_grid(s_center, s_driver, speed_kmh / 3.6)
++        throttle_on_grid = _resample_on_grid(s_center, s_driver, throttle)
++        brake_on_grid = _resample_on_grid(s_center, s_driver, brake)
++        x_on_grid = _resample_on_grid(s_center, s_driver, x_m)
++        y_on_grid = _resample_on_grid(s_center, s_driver, y_m)
++
++        try:
++            lap_time = float(lap["LapTime"].total_seconds())
++        except Exception:
++            lap_time = float(s_center[-1] / max(float(np.mean(speed_on_grid)), 1.0)) if s_center.size else 0.0
++
++        drivers[code] = DriverLapData(
++            driver=code,
++            s=s_center,
++            speed=speed_on_grid,
++            x=x_on_grid,
++            y=y_on_grid,
++            throttle=throttle_on_grid,
++            brake=brake_on_grid,
++            lap_time=lap_time,
+         )
++
++    if not drivers:
++        return None
++
++    return SpaSessionData(
++        year=year,
++        session_name=session_name,
++        centerline_x=centerline_x,
++        centerline_y=centerline_y,
++        s=s_center,
++        curvature=curvature,
++        track_width=track_width,
++        drivers=drivers,
++        reference_driver=reference_driver,
++    )
++
+diff --git a/src/racing_line_pinn/reporting.py b/src/racing_line_pinn/reporting.py
+deleted file mode 100644
+index 7470ef0..0000000
+--- a/src/racing_line_pinn/reporting.py
++++ /dev/null
+@@ -1,28 +0,0 @@
+-"""Reporting utilities for summarizing lap-performance comparison results."""
+-
+-from __future__ import annotations
+-
+-from dataclasses import dataclass
+-
+-from .compare import calculate_speed_metrics
+-
+-
+-@dataclass
+-class ComparisonReport:
+-    rmse: float
+-    mae: float
+-    mean_error: float
+-    driver_speed: list[float]
+-    predicted_speed: list[float]
+-
+-
+-def build_report(actual_speed: list[float], predicted_speed: list[float]) -> ComparisonReport:
+-    """Create a structured report for model-vs-driver speed comparison."""
+-    metrics = calculate_speed_metrics(actual_speed, predicted_speed)
+-    return ComparisonReport(
+-        rmse=metrics["rmse"],
+-        mae=metrics["mae"],
+-        mean_error=metrics["mean_error"],
+-        driver_speed=list(actual_speed),
+-        predicted_speed=list(predicted_speed),
+-    )
+diff --git a/src/racing_line_pinn/session_analysis.py b/src/racing_line_pinn/session_analysis.py
+deleted file mode 100644
+index 4a9b2da..0000000
+--- a/src/racing_line_pinn/session_analysis.py
++++ /dev/null
+@@ -1,70 +0,0 @@
+-"""Session-level comparison between real or synthetic telemetry and model predictions."""
+-
+-from __future__ import annotations
+-
+-import numpy as np
+-
+-from .physics import compute_racing_line_target_speed
+-
+-
+-def estimate_curvature_from_xy(x: list[float] | np.ndarray, y: list[float] | np.ndarray) -> np.ndarray:
+-    """Estimate a simple curvature proxy from projected x/y coordinates."""
+-    x_arr = np.asarray(x, dtype=float)
+-    y_arr = np.asarray(y, dtype=float)
+-    if len(x_arr) < 3 or len(y_arr) < 3:
+-        return np.array([], dtype=float)
+-
+-    dx = np.diff(x_arr)
+-    dy = np.diff(y_arr)
+-    dtheta = np.arctan2(dy, dx)
+-    curvature = np.abs(np.diff(np.unwrap(dtheta))) / np.maximum(np.hypot(dx[:-1], dy[:-1]), 1e-6)
+-    return np.pad(curvature, (1, 1), constant_values=curvature[0] if len(curvature) else 0.0)
+-
+-
+-def compare_session_to_model(session: dict, mu: float, downforce: float, mass: float) -> dict:
+-    """Compare a track session against physics-informed speed predictions."""
+-    x = np.asarray(session.get("x", []), dtype=float)
+-    y = np.asarray(session.get("y", []), dtype=float)
+-    actual_speed = np.asarray(session.get("speed", []), dtype=float)
+-
+-    if len(x) == 0 or len(y) == 0 or len(actual_speed) == 0:
+-        actual_speed = np.linspace(20.0, 35.0, max(len(x), len(y), 10), dtype=float)
+-
+-    curvature = estimate_curvature_from_xy(x, y)
+-    if curvature.size == 0:
+-        curvature = np.full(len(actual_speed), 0.05, dtype=float)
+-
+-    radius = np.maximum(1.0 / np.clip(np.abs(curvature), 1e-6, None), 1.0)
+-    predicted_speed = np.array(
+-        [
+-            compute_racing_line_target_speed(
+-                curvature=float(c),
+-                radius=float(r),
+-                mu=float(mu),
+-                mass=float(mass),
+-                downforce=float(downforce),
+-            )
+-            for c, r in zip(curvature, radius)
+-        ],
+-        dtype=float,
+-    )
+-
+-    actual_speed = np.asarray(actual_speed, dtype=float)
+-    if actual_speed.shape[0] != predicted_speed.shape[0]:
+-        length = min(actual_speed.shape[0], predicted_speed.shape[0])
+-        actual_speed = actual_speed[:length]
+-        predicted_speed = predicted_speed[:length]
+-
+-    errors = predicted_speed - actual_speed
+-    metrics = {
+-        "rmse": float(np.sqrt(np.mean(errors ** 2))),
+-        "mae": float(np.mean(np.abs(errors))),
+-        "mean_error": float(np.mean(errors)),
+-    }
+-
+-    return {
+-        "actual_speed": actual_speed.tolist(),
+-        "predicted_speed": predicted_speed.tolist(),
+-        "curvature": curvature.tolist(),
+-        "metrics": metrics,
+-    }
+diff --git a/src/racing_line_pinn/telemetry.py b/src/racing_line_pinn/telemetry.py
+deleted file mode 100644
+index ad04067..0000000
+--- a/src/racing_line_pinn/telemetry.py
++++ /dev/null
+@@ -1,29 +0,0 @@
+-"""Synthetic telemetry generation for racing-line visualization demos."""
+-
+-from __future__ import annotations
+-
+-import math
+-
+-import numpy as np
+-
+-
+-def generate_track_geometry(n_points: int = 200):
+-    """Create a synthetic cornering track approximating a single hairpin-style section."""
+-    s = np.linspace(0.0, 1.0, n_points)
+-    x = 0.8 * np.cos(2.0 * np.pi * s) + 0.2 * np.sin(6.0 * np.pi * s)
+-    y = 0.5 * np.sin(2.0 * np.pi * s) + 0.15 * np.cos(4.0 * np.pi * s)
+-    curvature = 0.08 + 0.22 * np.sin(2.0 * np.pi * s)
+-    return x, y, curvature
+-
+-
+-def generate_telemetry_track(x: np.ndarray, y: np.ndarray, ideal_offset: float = 0.06):
+-    """Create actual and theoretical trajectory samples with a slight offset and noise."""
+-    rng = np.random.default_rng(42)
+-    actual_x = x + ideal_offset * np.sin(np.linspace(0.0, 2.0 * math.pi, len(x))) + 0.02 * rng.normal(size=len(x))
+-    actual_y = y + ideal_offset * np.cos(np.linspace(0.0, 2.0 * math.pi, len(y))) + 0.02 * rng.normal(size=len(y))
+-    ideal_x = x + 0.0 * np.ones_like(x)
+-    ideal_y = y + 0.0 * np.ones_like(y)
+-    return {
+-        "actual": {"x": actual_x, "y": actual_y},
+-        "ideal": {"x": ideal_x, "y": ideal_y},
+-    }
+diff --git a/src/racing_line_pinn/training.py b/src/racing_line_pinn/training.py
+index 4c1fcd3..0b96441 100644
+--- a/src/racing_line_pinn/training.py
++++ b/src/racing_line_pinn/training.py
+@@ -1,51 +1,63 @@
+-"""Training loop for a simple physics-informed racing-line regressor."""
++"""Training loop for the physics-informed racing-line speed regressor."""
+ 
+ from __future__ import annotations
+ 
++import numpy as np
+ import torch
+ from torch import nn
+ 
+-from .dataset import generate_synthetic_track_samples
++from .calibration import VehicleParams
++from .dataset import build_training_samples
+ from .model import RacingLinePINN, physics_loss
+ 
+ 
+ def train_model(
++    s: np.ndarray,
++    curvature: np.ndarray,
++    vehicle: VehicleParams,
+     epochs: int = 200,
+     learning_rate: float = 1e-3,
+     hidden_dim: int = 64,
+     device: str | None = None,
+-):
+-    """Train a compact model using synthetic track data and physics-aware loss."""
++) -> tuple[nn.Module, torch.Tensor]:
++    """Train the shared ideal-line model on one session's curvature profile.
++
++    Returns the trained model and its predicted speed-vs-arc-length curve
++    (same order/length as ``s``) so callers can reuse it without a second
++    inference pass.
++    """
+     if device is None:
+         device = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+-    features, curvature, mu, downforce, mass, target_speed = generate_synthetic_track_samples()
+-    model = RacingLinePINN(input_dim=4, hidden_dim=hidden_dim).to(device)
++    curvature_t, target_speed_t, _corner_cap_t = build_training_samples(s, curvature, vehicle)
++    model = RacingLinePINN(input_dim=1, hidden_dim=hidden_dim).to(device)
+     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+ 
+-    x = features.to(device)
+-    y = target_speed.to(device)
+-    c = curvature.to(device)
+-    mu_t = mu.to(device)
+-    d = downforce.to(device)
+-    m = mass.to(device)
++    x = curvature_t.unsqueeze(-1).to(device)
++    y = target_speed_t.to(device)
++    c = curvature_t.to(device)
+ 
+     for epoch in range(epochs):
+         model.train()
+         optimizer.zero_grad()
+         pred = model(x)
+-        loss = physics_loss(pred, c, mu_t, d, m, y)
++        loss = physics_loss(pred, c, y, vehicle)
+         loss.backward()
+         optimizer.step()
+ 
+         if epoch % 50 == 0:
+             print(f"Epoch {epoch:03d} | Loss: {loss.item():.6f}")
+ 
+-    return model
++    model.eval()
++    with torch.no_grad():
++        predicted_speed = model(x).cpu()
++
++    return model, predicted_speed
+ 
+ 
+-def predict_speed(model: nn.Module, curvature: float, radius: float, mu: float, downforce: float, mass: float):
+-    """Predict speed from a single track state."""
+-    tensor = torch.tensor([[curvature, radius, mu, downforce]], dtype=torch.float32)
++def predict_speed(model: nn.Module, curvature: float) -> float:
++    """Predict the shared ideal-line speed at a single curvature value."""
++    tensor = torch.tensor([[curvature]], dtype=torch.float32)
+     with torch.no_grad():
+         return float(model(tensor).item())
++
+diff --git a/src/racing_line_pinn/visualization.py b/src/racing_line_pinn/visualization.py
+index dd40d27..f9274ea 100644
+--- a/src/racing_line_pinn/visualization.py
++++ b/src/racing_line_pinn/visualization.py
+@@ -1,30 +1,199 @@
+-"""Visualization helpers for comparing actual and ideal racing trajectories."""
++"""Animated-lap visualization: 2D track map + throttle/brake/steering gauges."""
+ 
+ from __future__ import annotations
+ 
+-import os
++import numpy as np
++import plotly.graph_objects as go
++from plotly.subplots import make_subplots
+ 
+-import matplotlib
++from .real_data import SpaSessionData
+ 
+-matplotlib.use("Agg")
+-import matplotlib.pyplot as plt
++MAX_STEERING_DEG = 90.0
++STEERING_REFERENCE_CURVATURE = 0.05  # scales curvature -> a plausible steering angle (approximation, not measured)
++DEFAULT_FRAME_DT = 0.2
++SLIDER_STEP_STRIDE = 10
+ 
+ 
+-def plot_racing_line_comparison(actual_x, actual_y, ideal_x, ideal_y, save_path: str = "outputs/racing_line_comparison.png"):
+-    """Plot actual versus predicted racing line overlay with a track-like background."""
+-    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
++def _cumulative_time(s: np.ndarray, speed: np.ndarray) -> np.ndarray:
++    """Elapsed real time at each sample, via cumsum(ds / speed)."""
++    ds = np.diff(s, prepend=s[0])
++    return np.cumsum(ds / np.clip(speed, 1.0, None))
++
++
++def _derive_steering_deg(curvature: np.ndarray) -> np.ndarray:
++    """Approximate steering angle from local path curvature (FastF1 has no steering channel)."""
++    return np.clip(curvature / STEERING_REFERENCE_CURVATURE * MAX_STEERING_DEG, -MAX_STEERING_DEG, MAX_STEERING_DEG)
++
++
++def build_animated_lap(
++    session: SpaSessionData,
++    driver_code: str,
++    model_speed: np.ndarray | None = None,
++    frame_dt: float = DEFAULT_FRAME_DT,
++) -> go.Figure:
++    """Build one animated figure: track map + throttle/brake/steering gauges.
++
++    Left region: the shared centerline (light gray) plus the selected
++    driver's actual path (bold) with an animated marker. Right region: 3
++    `go.Indicator` gauges. The marker and gauges update together per frame via
++    native Plotly `frames`/`updatemenus` (Play/Pause + scrubber) -- no manual
++    Streamlit animation loop.
++
++    Frames are sampled on a uniform REAL TIME grid (via each point's elapsed
++    time ds/speed), not a uniform index grid, so constant-duration playback
++    naturally speeds up on straights and slows in corners.
++
++    When `model_speed` is given (the trained model's predicted speed on the
++    same centerline `session.s`), an optional "ghost" marker rides the same
++    centerline geometry on its OWN time axis, so it can visibly pull ahead of
++    or fall behind the real driver; it freezes once it finishes its lap.
++    """
++    lap = session.drivers[driver_code]
++
++    t_driver = _cumulative_time(lap.s, lap.speed)
++    total_time = float(t_driver[-1]) if t_driver.size else 0.0
++    time_grid = np.arange(0.0, total_time + frame_dt, frame_dt) if total_time > 0 else np.array([0.0])
++
++    x_t = np.interp(time_grid, t_driver, lap.x)
++    y_t = np.interp(time_grid, t_driver, lap.y)
++    throttle_t = np.interp(time_grid, t_driver, lap.throttle)
++    brake_t = np.interp(time_grid, t_driver, lap.brake)
++    curvature_t = np.interp(time_grid, t_driver, session.curvature)
++    steering_t = _derive_steering_deg(curvature_t)
++
++    ghost_x_t: np.ndarray | None = None
++    ghost_y_t: np.ndarray | None = None
++    if model_speed is not None:
++        t_model = _cumulative_time(session.s, np.asarray(model_speed, dtype=float))
++        ghost_x_t = np.interp(time_grid, t_model, session.centerline_x, right=session.centerline_x[-1])
++        ghost_y_t = np.interp(time_grid, t_model, session.centerline_y, right=session.centerline_y[-1])
++
++    fig = make_subplots(
++        rows=3,
++        cols=2,
++        column_widths=[0.62, 0.38],
++        specs=[
++            [{"type": "xy", "rowspan": 3}, {"type": "indicator"}],
++            [None, {"type": "indicator"}],
++            [None, {"type": "indicator"}],
++        ],
++        horizontal_spacing=0.08,
++        vertical_spacing=0.08,
++    )
++
++    fig.add_trace(
++        go.Scatter(
++            x=session.centerline_x, y=session.centerline_y, mode="lines",
++            line=dict(color="rgba(255,255,255,0.25)", width=2), name="Track centerline",
++        ),
++        row=1, col=1,
++    )
++    fig.add_trace(
++        go.Scatter(x=lap.x, y=lap.y, mode="lines", line=dict(color="#4ea1ff", width=2), name=f"{driver_code} line"),
++        row=1, col=1,
++    )
++    driver_marker_index = len(fig.data)
++    fig.add_trace(
++        go.Scatter(
++            x=[x_t[0]], y=[y_t[0]], mode="markers",
++            marker=dict(color="#4ea1ff", size=14, symbol="circle"), name=driver_code,
++        ),
++        row=1, col=1,
++    )
++
++    ghost_marker_index = None
++    if ghost_x_t is not None and ghost_y_t is not None:
++        ghost_marker_index = len(fig.data)
++        fig.add_trace(
++            go.Scatter(
++                x=[ghost_x_t[0]], y=[ghost_y_t[0]], mode="markers",
++                marker=dict(color="#ff7f0e", size=14, symbol="diamond"), name="Model ghost",
++            ),
++            row=1, col=1,
++        )
++
++    throttle_index = len(fig.data)
++    fig.add_trace(
++        go.Indicator(
++            mode="gauge+number", value=float(throttle_t[0]), title={"text": "Throttle %"},
++            gauge=dict(axis=dict(range=[0, 100]), bar=dict(color="#36d17a")),
++        ),
++        row=1, col=2,
++    )
++    brake_index = len(fig.data)
++    fig.add_trace(
++        go.Indicator(
++            mode="gauge+number", value=float(brake_t[0]), title={"text": "Brake %"},
++            gauge=dict(axis=dict(range=[0, 100]), bar=dict(color="#ff4d4d")),
++        ),
++        row=2, col=2,
++    )
++    steering_index = len(fig.data)
++    fig.add_trace(
++        go.Indicator(
++            mode="gauge+number", value=float(steering_t[0]),
++            title={"text": "Steering \u00b0 (derived, approximate)"},
++            gauge=dict(axis=dict(range=[-MAX_STEERING_DEG, MAX_STEERING_DEG]), bar=dict(color="#4ea1ff")),
++        ),
++        row=3, col=2,
++    )
++
++    frames = []
++    for i in range(time_grid.size):
++        frame_data = [go.Scatter(x=[x_t[i]], y=[y_t[i]])]
++        trace_indices = [driver_marker_index]
++        if ghost_marker_index is not None:
++            frame_data.append(go.Scatter(x=[ghost_x_t[i]], y=[ghost_y_t[i]]))
++            trace_indices.append(ghost_marker_index)
++        frame_data.extend(
++            [go.Indicator(value=float(throttle_t[i])), go.Indicator(value=float(brake_t[i])), go.Indicator(value=float(steering_t[i]))]
++        )
++        trace_indices.extend([throttle_index, brake_index, steering_index])
++        frames.append(go.Frame(data=frame_data, traces=trace_indices, name=f"{time_grid[i]:.2f}"))
++
++    fig.frames = frames
++
++    frame_duration_ms = max(int(frame_dt * 1000), 10)
++    fig.update_layout(
++        template="plotly_dark",
++        title=f"{driver_code} -- animated lap (real elapsed time)",
++        paper_bgcolor="#050b14",
++        plot_bgcolor="#09131d",
++        font=dict(color="#eaf2ff"),
++        height=560,
++        margin=dict(l=20, r=20, t=60, b=40),
++        updatemenus=[
++            dict(
++                type="buttons",
++                showactive=False,
++                x=0.05, y=1.12, xanchor="left", yanchor="top",
++                buttons=[
++                    dict(
++                        label="Play", method="animate",
++                        args=[None, {"frame": {"duration": frame_duration_ms, "redraw": True}, "fromcurrent": True, "transition": {"duration": 0}}],
++                    ),
++                    dict(
++                        label="Pause", method="animate",
++                        args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}],
++                    ),
++                ],
++            )
++        ],
++        sliders=[
++            dict(
++                active=0,
++                x=0.05, y=-0.02, len=0.6,
++                steps=[
++                    dict(
++                        method="animate", label=f"{t:.0f}s",
++                        args=[[f"{t:.2f}"], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
++                    )
++                    for t in time_grid[::SLIDER_STEP_STRIDE]
++                ],
++            )
++        ],
++    )
++    fig.update_yaxes(scaleanchor="x", scaleratio=1, gridcolor="rgba(255,255,255,0.08)", row=1, col=1)
++    fig.update_xaxes(gridcolor="rgba(255,255,255,0.08)", row=1, col=1)
++    return fig
+ 
+-    fig, ax = plt.subplots(figsize=(9, 7))
+-    ax.plot(actual_x, actual_y, color="tab:blue", linewidth=2.5, label="Actual driver trajectory")
+-    ax.plot(ideal_x, ideal_y, color="tab:orange", linewidth=2.0, linestyle="--", label="Ideal racing line")
+-    ax.scatter(actual_x[0], actual_y[0], color="green", s=26, label="Start")
+-    ax.set_title("Racing Line vs. Physics-Informed Ideal Line")
+-    ax.set_xlabel("X [m]")
+-    ax.set_ylabel("Y [m]")
+-    ax.legend()
+-    ax.grid(True, alpha=0.3)
+-    ax.axis("equal")
+-    fig.tight_layout()
+-    fig.savefig(save_path, dpi=200)
+-    plt.close(fig)
+-    return save_path
+diff --git a/tests/test_calibration.py b/tests/test_calibration.py
+new file mode 100644
+index 0000000..8c9c411
+--- /dev/null
++++ b/tests/test_calibration.py
+@@ -0,0 +1,148 @@
++"""Calibration tests using a synthetic-but-physically-controlled session.
++
++Builds a fake :class:`SpaSessionData` (two corners of different radius, joined
++by straight accel/brake zones) whose speed trace is generated FROM known
++``mu``/aero/accel/decel constants via the same physics relations the
++calibration fits against, then checks that ``calibrate_vehicle_params``
++recovers those known constants.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from racing_line_pinn.calibration import MASS_KG, calibrate_vehicle_params
++from racing_line_pinn.physics import (
++    calculate_aero_drag,
++    calculate_speed_dependent_normal_load,
++    pacejka_combined_friction_limit,
++)
++from racing_line_pinn.real_data import DriverLapData, SpaSessionData
++
++MU_TRUE = 1.6
++AERO_LIFT_AREA_TRUE = 3.0
++AERO_DRAG_AREA_TRUE = 1.2
++MAX_ACCEL_TRUE = 10.0
++MAX_DECEL_TRUE = 45.0
++DS = 0.5
++
++
++def _apex_speed(radius: float) -> float:
++    """Self-consistent corner speed for the known mu/aero params (fixed-point iteration)."""
++    speed = 30.0
++    for _ in range(100):
++        normal_force = calculate_speed_dependent_normal_load(MASS_KG, speed, 1.0, AERO_LIFT_AREA_TRUE)
++        limit = pacejka_combined_friction_limit(MU_TRUE, normal_force, MASS_KG, long_accel=0.0)
++        speed = (limit * radius) ** 0.5
++    return speed
++
++
++def _accel_zone(v_start: float, v_target: float) -> tuple[np.ndarray, np.ndarray]:
++    """Euler-integrate dv/dt = max_accel - drag_decel(v) in time, returning (s, speed) on a DS grid."""
++    dt = 0.005
++    t, s, v = 0.0, 0.0, v_start
++    s_samples = [0.0]
++    v_samples = [v_start]
++    while v < v_target and t < 120.0:
++        drag_decel = calculate_aero_drag(v, 1.0, AERO_DRAG_AREA_TRUE) / MASS_KG
++        a = MAX_ACCEL_TRUE - drag_decel
++        v += a * dt
++        s += v * dt
++        t += dt
++        s_samples.append(s)
++        v_samples.append(v)
++
++    s_grid = np.arange(0.0, s_samples[-1], DS)
++    speed_grid = np.interp(s_grid, s_samples, v_samples)
++    return s_grid, speed_grid
++
++
++def _brake_zone(v_start: float, v_end: float) -> tuple[np.ndarray, np.ndarray]:
++    """Analytic constant-deceleration kinematics: v(s)^2 = v_start^2 - 2*max_decel*s."""
++    length = (v_start ** 2 - v_end ** 2) / (2.0 * MAX_DECEL_TRUE)
++    s_grid = np.arange(0.0, length, DS)
++    speed_grid = np.sqrt(np.maximum(v_start ** 2 - 2.0 * MAX_DECEL_TRUE * s_grid, v_end ** 2))
++    return s_grid, speed_grid
++
++
++def _build_synthetic_session() -> tuple[SpaSessionData, float]:
++    radius1, radius2 = 40.0, 90.0
++    v_apex1 = _apex_speed(radius1)
++    v_apex2 = _apex_speed(radius2)
++    kappa1, kappa2 = 1.0 / radius1, 1.0 / radius2
++
++    apex_len = 20.0
++    s_apex1 = np.arange(0.0, apex_len, DS)
++    s_zoneA, v_zoneA = _accel_zone(v_apex1, 80.0)
++    s_zoneB, v_zoneB = _brake_zone(80.0, v_apex2)
++    s_apex2 = np.arange(0.0, apex_len, DS)
++    s_zoneC, v_zoneC = _accel_zone(v_apex2, v_apex2 + 25.0)
++
++    segments_s = [s_apex1, s_zoneA, s_zoneB, s_apex2, s_zoneC]
++    segments_v = [
++        np.full_like(s_apex1, v_apex1),
++        v_zoneA,
++        v_zoneB,
++        np.full_like(s_apex2, v_apex2),
++        v_zoneC,
++    ]
++    segments_kappa = [
++        np.full_like(s_apex1, kappa1),
++        np.zeros_like(s_zoneA),
++        np.zeros_like(s_zoneB),
++        np.full_like(s_apex2, kappa2),
++        np.zeros_like(s_zoneC),
++    ]
++
++    offsets = np.cumsum([0.0] + [seg[-1] + DS for seg in segments_s[:-1]])
++    s = np.concatenate([seg + off for seg, off in zip(segments_s, offsets)])
++    speed = np.concatenate(segments_v)
++    curvature = np.concatenate(segments_kappa)
++
++    total_length = s[-1]
++    # Percentile just above the exact zero-curvature fraction, so both nonzero
++    # corner clusters are selected while every straight (curvature == 0) sample is not.
++    zero_fraction = float(np.mean(curvature == 0.0))
++    apex_percentile = min(zero_fraction * 100.0 + 0.5, 99.9)
++
++    driver = DriverLapData(
++        driver="TST",
++        s=s,
++        speed=speed,
++        x=s,
++        y=np.zeros_like(s),
++        throttle=np.zeros_like(s),
++        brake=np.zeros_like(s),
++        lap_time=float(total_length / np.mean(speed)),
++    )
++    session = SpaSessionData(
++        year=2023,
++        session_name="R",
++        centerline_x=s,
++        centerline_y=np.zeros_like(s),
++        s=s,
++        curvature=curvature,
++        track_width=np.full_like(s, 12.0),
++        drivers={"TST": driver},
++        reference_driver="TST",
++    )
++    return session, apex_percentile
++
++
++def test_calibration_recovers_known_mu_and_lift_area():
++    session, apex_percentile = _build_synthetic_session()
++    params = calibrate_vehicle_params(session, apex_percentile=apex_percentile)
++
++    assert params.mu == pytest.approx(MU_TRUE, rel=0.1)
++    assert params.aero_lift_area == pytest.approx(AERO_LIFT_AREA_TRUE, rel=0.3)
++
++
++def test_calibration_recovers_plausible_accel_decel_and_drag():
++    session, apex_percentile = _build_synthetic_session()
++    params = calibrate_vehicle_params(session, apex_percentile=apex_percentile)
++
++    assert params.max_accel == pytest.approx(MAX_ACCEL_TRUE, rel=0.2)
++    assert params.max_decel == pytest.approx(MAX_DECEL_TRUE, rel=0.2)
++    assert params.aero_drag_area == pytest.approx(AERO_DRAG_AREA_TRUE, rel=0.4)
++    assert params.mass == MASS_KG
+diff --git a/tests/test_evaluation.py b/tests/test_evaluation.py
+new file mode 100644
+index 0000000..d2770ea
+--- /dev/null
++++ b/tests/test_evaluation.py
+@@ -0,0 +1,52 @@
++import numpy as np
++
++from racing_line_pinn.evaluation import build_leaderboard, calculate_speed_metrics, compare_driver_to_model
++from racing_line_pinn.real_data import DriverLapData
++
++
++def _make_lap(driver: str, s: np.ndarray, speed: np.ndarray) -> DriverLapData:
++    return DriverLapData(
++        driver=driver,
++        s=s,
++        speed=speed,
++        x=s,
++        y=np.zeros_like(s),
++        throttle=np.full_like(s, 100.0),
++        brake=np.zeros_like(s),
++        lap_time=float(np.trapezoid(1.0 / np.clip(speed, 1.0, None), s)),
++    )
++
++
++def test_speed_metrics_are_non_negative():
++    actual = [30.0, 32.0, 28.0, 35.0]
++    predicted = [31.0, 31.5, 29.0, 34.0]
++    metrics = calculate_speed_metrics(actual, predicted)
++    assert metrics["rmse"] >= 0.0
++    assert metrics["mae"] >= 0.0
++
++
++def test_compare_driver_to_model_zero_delta_when_identical():
++    s = np.linspace(0.0, 100.0, 11)
++    speed = np.full_like(s, 50.0)
++    comparison = compare_driver_to_model("D1", s, speed, s, speed)
++    assert comparison.rmse == 0.0
++    assert comparison.total_delta_t == 0.0
++
++
++def test_compare_driver_to_model_detects_slower_driver():
++    s = np.linspace(0.0, 100.0, 11)
++    model_speed = np.full_like(s, 50.0)
++    driver_speed = np.full_like(s, 40.0)  # slower everywhere than the model
++    comparison = compare_driver_to_model("D1", s, driver_speed, s, model_speed)
++    assert comparison.total_delta_t > 0.0  # driver lost time relative to the model
++
++
++def test_build_leaderboard_sorts_fastest_relative_to_model_first():
++    s = np.linspace(0.0, 100.0, 11)
++    model_speed = np.full_like(s, 50.0)
++    drivers = {
++        "SLOW": _make_lap("SLOW", s, np.full_like(s, 30.0)),
++        "FAST": _make_lap("FAST", s, np.full_like(s, 48.0)),
++    }
++    leaderboard = build_leaderboard(drivers, s, model_speed)
++    assert [comparison.driver for comparison in leaderboard] == ["FAST", "SLOW"]
+diff --git a/tests/test_physics.py b/tests/test_physics.py
+index b7e2cae..f81ec4b 100644
+--- a/tests/test_physics.py
++++ b/tests/test_physics.py
+@@ -5,8 +5,6 @@ from racing_line_pinn.physics import (
+     compute_corner_speed_limit,
+     compute_racing_line_target_speed,
+ )
+-from racing_line_pinn.compare import calculate_speed_metrics, synthesize_driver_trajectory
+-from racing_line_pinn.session_analysis import compare_session_to_model, estimate_curvature_from_xy
+ 
+ 
+ def test_lateral_grip_limit_is_positive_and_increases_with_downforce():
+@@ -34,33 +32,3 @@ def test_target_speed_uses_curvature_and_lateral_limit():
+     assert speed > 0
+     assert math.isfinite(speed)
+ 
+-
+-def test_speed_metrics_are_non_negative_and_synthesize_trajectory_has_expected_shape():
+-    actual = [30.0, 32.0, 28.0, 35.0]
+-    predicted = [31.0, 31.5, 29.0, 34.0]
+-    metrics = calculate_speed_metrics(actual, predicted)
+-    assert metrics["rmse"] >= 0.0
+-    assert metrics["mae"] >= 0.0
+-    assert metrics["mean_error"] >= -100.0
+-
+-    trajectory = synthesize_driver_trajectory(8)
+-    assert len(trajectory["x"]) == 8
+-    assert len(trajectory["y"]) == 8
+-
+-
+-def test_curve_estimation_and_session_compare_are_finite():
+-    x = [-1.0, -0.5, 0.0, 0.5, 1.0]
+-    y = [0.0, 0.5, 0.0, -0.5, 0.0]
+-    curvature = estimate_curvature_from_xy(x, y)
+-    assert curvature.size > 0
+-    assert all(value == value for value in curvature)
+-
+-    session = {
+-        "x": x,
+-        "y": y,
+-        "speed": [20.0, 24.0, 28.0, 24.0, 20.0],
+-    }
+-    result = compare_session_to_model(session, mu=1.4, downforce=3000.0, mass=800.0)
+-    assert result["actual_speed"]
+-    assert result["predicted_speed"]
+-    assert result["metrics"]["rmse"] >= 0.0
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+new file mode 100644
+index 0000000..3db19e4
+--- /dev/null
++++ b/tests/test_pipeline.py
+@@ -0,0 +1,70 @@
++"""Pipeline-shape tests: common-s grid resampling invariant + full calibrate->train->evaluate chain.
++
++Can't hit live FastF1 in this sandbox, so these exercise the same shape/alignment
++invariants that `load_spa_race_session` guarantees (every driver resampled onto one
++shared centerline `s` grid) using the synthetic-but-physically-controlled fixture
++from `test_calibration.py`, plus a full run of the non-network part of the CLI
++pipeline (calibrate -> train -> leaderboard) end-to-end.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++
++from racing_line_pinn.evaluation import build_leaderboard
++from racing_line_pinn.real_data import DriverLapData, _resample_on_grid
++from racing_line_pinn.training import train_model
++
++from test_calibration import _build_synthetic_session
++
++
++def test_resample_on_grid_preserves_range_and_shape():
++    s_source = np.array([0.0, 2.0, 4.0, 6.0, 8.0])
++    values = np.array([10.0, 12.0, 11.0, 15.0, 13.0])
++    s_target = np.linspace(0.0, 8.0, 17)
++
++    resampled = _resample_on_grid(s_target, s_source, values)
++
++    assert resampled.shape == s_target.shape
++    assert resampled.min() >= values.min()
++    assert resampled.max() <= values.max()
++
++
++def test_all_drivers_share_the_session_s_grid():
++    session, _apex_percentile = _build_synthetic_session()
++    reference = session.drivers["TST"]
++
++    second_driver = DriverLapData(
++        driver="TS2",
++        s=session.s,
++        speed=reference.speed * 0.98,
++        x=reference.x,
++        y=reference.y,
++        throttle=reference.throttle,
++        brake=reference.brake,
++        lap_time=reference.lap_time * 1.02,
++    )
++    session.drivers["TS2"] = second_driver
++
++    for lap in session.drivers.values():
++        assert lap.s.shape == session.s.shape
++        assert np.array_equal(lap.s, session.s)
++
++
++def test_full_pipeline_shapes_end_to_end():
++    from racing_line_pinn.calibration import calibrate_vehicle_params
++
++    session, apex_percentile = _build_synthetic_session()
++    vehicle = calibrate_vehicle_params(session, apex_percentile=apex_percentile)
++
++    _model, predicted_speed = train_model(session.s, session.curvature, vehicle, epochs=5, hidden_dim=8)
++    predicted_speed_np = predicted_speed.numpy().reshape(-1)
++
++    assert predicted_speed_np.shape == session.s.shape
++    assert np.all(np.isfinite(predicted_speed_np))
++
++    leaderboard = build_leaderboard(session.drivers, session.s, predicted_speed_np)
++    assert len(leaderboard) == len(session.drivers)
++    for comparison in leaderboard:
++        assert comparison.s.shape == session.s.shape
++        assert np.isfinite(comparison.total_delta_t)
+diff --git a/tests/test_visualization.py b/tests/test_visualization.py
+new file mode 100644
+index 0000000..34a09e3
+--- /dev/null
++++ b/tests/test_visualization.py
+@@ -0,0 +1,29 @@
++from __future__ import annotations
++
++import numpy as np
++
++from racing_line_pinn.visualization import build_animated_lap
++
++from test_calibration import _build_synthetic_session
++
++
++def test_build_animated_lap_without_ghost():
++    session, _apex_percentile = _build_synthetic_session()
++    fig = build_animated_lap(session, "TST", frame_dt=1.0)
++
++    assert len(fig.frames) > 0
++    # centerline + driver line + driver marker + 3 gauges = 6 static traces (no ghost).
++    assert len(fig.data) == 6
++    assert fig.layout.updatemenus
++    assert fig.layout.sliders
++
++
++def test_build_animated_lap_with_model_ghost():
++    session, _apex_percentile = _build_synthetic_session()
++    model_speed = np.full_like(session.curvature, np.mean(session.drivers["TST"].speed))
++    fig = build_animated_lap(session, "TST", model_speed=model_speed, frame_dt=1.0)
++
++    # +1 trace for the ghost marker.
++    assert len(fig.data) == 7
++    first_frame = fig.frames[0]
++    assert len(first_frame.data) == 5  # driver marker + ghost marker + 3 gauges

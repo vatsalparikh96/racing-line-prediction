@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Racing Line PINN — Architecture Diagram</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: #0d1622;
+    color: #eaf2ff;
+    margin: 0;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  p.subtitle {
+    margin-top: 0;
+    color: #9fb3cc;
+    font-size: 0.9rem;
+  }
+  .toolbar {
+    margin: 12px 0 20px;
+  }
+  button {
+    background: #1a2a3d;
+    color: #eaf2ff;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  button:hover {
+    background: #24374d;
+  }
+  .diagram-wrap {
+    background: #050b14;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 24px;
+    overflow: auto;
+  }
+  .legend-swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .legend-swatch.existing {
+    background: #1a2a3d;
+    border: 1px solid rgba(255,255,255,0.3);
+  }
+  .legend-swatch.planned {
+    background: #3a2f10;
+    border: 1px dashed #f5a623;
+  }
+  .legend-swatch.deprecated {
+    background: #3a1010;
+    border: 1px dashed #ff4d4d;
+  }
+  table.matrix {
+    border-collapse: collapse;
+    width: 100%;
+    margin-top: 12px;
+    font-size: 0.88rem;
+  }
+  table.matrix th, table.matrix td {
+    border: 1px solid rgba(255,255,255,0.12);
+    padding: 10px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  table.matrix th {
+    background: #14202f;
+    color: #f2f5fb;
+  }
+  table.matrix td {
+    background: rgba(18,30,43,0.6);
+  }
+  @media print {
+    .toolbar { display: none; }
+    body { background: #fff; color: #000; }
+    .diagram-wrap { border: none; background: #fff; }
+    table.matrix th, table.matrix td { color: #000; background: #fff; }
+  }
+</style>
+</head>
+<body>
+  <h1>Racing Line PINN — Architecture Diagram</h1>
+  <p class="subtitle">
+    Module and dependency graph for app.py and the racing_line_pinn package.<br/>
+    <span class="legend-swatch existing"></span> Implemented &nbsp;&nbsp;
+    <span class="legend-swatch planned"></span> Planned extension (not yet implemented) &nbsp;&nbsp;
+    <span class="legend-swatch deprecated"></span> To be replaced
+  </p>
+  <div class="toolbar">
+    <button onclick="window.print()">Print / Export as PDF</button>
+  </div>
+  <div class="diagram-wrap">
+    <pre class="mermaid">
+graph TD
+    subgraph UI["Streamlit UI"]
+        APP["app.py"]
+        AEROUI["Aero setup sliders:<br/>C_L (downforce), C_D (drag)"]
+        CACHE["@st.cache_data / @st.cache_resource<br/>isolate UI reruns"]
+
+        SPEEDTRACE_OLD["Speed trace (current)<br/>single chart, spiking artifacts"]
+        HEATMAP_OLD["Speed heatmap (current)<br/>2-row color heatmap"]
+        TRACKMAP_OLD["Lap figure (current)<br/>unaligned coordinate plot"]
+
+        SPEEDSPLIT["Subplot 1: Speed<br/>v_Actual vs v_PINN"]
+        DELTATIME["Subplot 2: Δt(s)<br/>continuous time-loss curve"]
+        GG["build_gg_diagram()<br/>G-G scatter, dynamic friction envelope"]
+        TRACKMAP_NEW["Rotated track map<br/>color-coded by Δv(s), scaleanchor='x'"]
+        DELTA["build_delta_traces()<br/>Δv(s), Δt(s) vs driver"]
+    end
+
+    subgraph PKG["racing_line_pinn package"]
+        INIT["__init__.py (public API)"]
+        LIVE["live_demo.py<br/>TRACK_LIBRARY, CAR_PRESETS,<br/>simulate_session()"]
+        REALDATA["real_data.py<br/>load_spa_race_session()"]
+        NORM["normalize_and_rotate()<br/>decimeter to meter,<br/>PCA/rotation so straights are horizontal"]
+        FRENET["frenet.py<br/>cartesian_to_frenet(s, d)"]
+        BOUNDS["track boundary extrusion<br/>W(s), |d(s)| &lt;= W(s)/2"]
+        SESSAN["session_analysis.py<br/>compare_session_to_model()"]
+        COMPARE["compare.py<br/>calculate_speed_metrics()"]
+        PHYSICS["physics.py<br/>compute_racing_line_target_speed()"]
+        AEROLOAD["downforce-dependent load limits<br/>F_z = mg + 1/2 rho C_L A v^2"]
+        PACEJKA["Pacejka combined friction ellipse<br/>a_lat = v^2 kappa, a_long = v dv/ds"]
+        WEIGHTXFER["two-track weight transfer<br/>delta F_z per wheel"]
+        DATASET["dataset.py<br/>generate_synthetic_track_samples()"]
+        MODEL["model.py<br/>RacingLinePINN, physics_loss()"]
+        LOSSEXT["multi-term loss:<br/>lap time integral(1/v ds)<br/>+ friction/limit ReLU penalties"]
+        TRAIN["training.py<br/>train_model(), predict_speed()"]
+        CLI["cli.py<br/>CLI entrypoint"]
+        REPORT["reporting.py<br/>build_report()"]
+        VIZ["visualization.py<br/>plot_racing_line_comparison()"]
+        TELEM["telemetry.py<br/>synthetic track/telemetry gen"]
+    end
+
+    subgraph EXT["External dependencies"]
+        ST["streamlit"]
+        PLOTLY["plotly"]
+        TORCH["torch"]
+        NP["numpy / pandas"]
+        MPL["matplotlib"]
+        OPENF1["OpenF1 API"]
+    end
+
+    APP --> ST
+    APP --> PLOTLY
+    APP --> COMPARE
+    APP --> LIVE
+    APP --> REALDATA
+    APP --> SESSAN
+    APP --> AEROUI
+    APP --> CACHE
+    APP --> SPEEDTRACE_OLD
+    APP --> HEATMAP_OLD
+    APP --> TRACKMAP_OLD
+    SPEEDTRACE_OLD -.replaced by.-> SPEEDSPLIT
+    SPEEDTRACE_OLD -.replaced by.-> DELTATIME
+    HEATMAP_OLD -.replaced by.-> GG
+    TRACKMAP_OLD -.replaced by.-> TRACKMAP_NEW
+    APP --> DELTA
+    CACHE -.wraps.-> REALDATA
+    CACHE -.wraps.-> TRAIN
+    AEROUI --> AEROLOAD
+    GG --> PACEJKA
+    DELTA --> SESSAN
+    SPEEDSPLIT --> SESSAN
+    DELTATIME --> SESSAN
+    TRACKMAP_NEW --> SESSAN
+
+    REALDATA --> NORM
+    NORM --> FRENET
+    FRENET --> BOUNDS
+    BOUNDS --> SESSAN
+
+    LIVE --> PHYSICS
+    LIVE --> NP
+    SESSAN --> PHYSICS
+    SESSAN --> NP
+    REALDATA --> OPENF1
+
+    PHYSICS --> AEROLOAD
+    PHYSICS --> PACEJKA
+    PHYSICS --> WEIGHTXFER
+    DATASET --> PHYSICS
+    DATASET --> TORCH
+    TRAIN --> DATASET
+    TRAIN --> MODEL
+    MODEL --> TORCH
+    MODEL --> LOSSEXT
+    CLI --> TRAIN
+
+    REPORT --> COMPARE
+    COMPARE --> NP
+    VIZ --> MPL
+    TELEM --> NP
+
+    INIT -.exports.-> COMPARE
+    INIT -.exports.-> DATASET
+    INIT -.exports.-> PHYSICS
+    INIT -.exports.-> REALDATA
+    INIT -.exports.-> REPORT
+    INIT -.exports.-> SESSAN
+    INIT -.exports.-> TRAIN
+
+    classDef planned fill:#3a2f10,stroke:#f5a623,stroke-width:2px,stroke-dasharray: 4 3,color:#ffe0a3;
+    classDef deprecated fill:#3a1010,stroke:#ff4d4d,stroke-width:2px,stroke-dasharray: 2 2,color:#ffb3b3;
+    class AEROUI,CACHE,GG,DELTA,SPEEDSPLIT,DELTATIME,TRACKMAP_NEW,NORM,FRENET,BOUNDS,AEROLOAD,PACEJKA,WEIGHTXFER,LOSSEXT planned
+    class SPEEDTRACE_OLD,HEATMAP_OLD,TRACKMAP_OLD deprecated
+    </pre>
+  </div>
+
+  <h2 style="font-size:1.1rem;margin-top:32px;">Implementation Target Matrix</h2>
+  <p class="subtitle">
+    Current output graphs (red, dashed) are considered worthless and are slated for full replacement — not incremental extension.
+  </p>
+  <table class="matrix">
+    <thead>
+      <tr>
+        <th>Target Component</th>
+        <th>Old Implementation</th>
+        <th>New Replacement</th>
+        <th>Benefit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Speed Trace</td>
+        <td>Single chart with spiking artifact curves</td>
+        <td>Subplot 1: Speed (v<sub>Actual</sub> vs. v<sub>PINN</sub>)</td>
+        <td>Eliminates scaling anomalies and clarifies speed gaps</td>
+      </tr>
+      <tr>
+        <td>Delta Time</td>
+        <td>None</td>
+        <td>Subplot 2: continuous Δt(s) curve in seconds</td>
+        <td>Quantifies time loss per corner/sector</td>
+      </tr>
+      <tr>
+        <td>Grip Limits</td>
+        <td>2-row color heatmap</td>
+        <td>G–G scatter plot with dynamic friction envelope</td>
+        <td>Displays brake/cornering traction envelope usage</td>
+      </tr>
+      <tr>
+        <td>Track Map</td>
+        <td>Unaligned coordinate plot</td>
+        <td>Rotated 2D line map color-coded by speed delta Δv</td>
+        <td>Shows spatial time loss directly on track geometry</td>
+      </tr>
+    </tbody>
+  </table>
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</body>
+</html>
